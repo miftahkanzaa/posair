@@ -1,12 +1,938 @@
-<!DOCTYPE html>
-<html lang="id">
-  <head>
-    <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>AirKu POS — Depo Air Minum</title>
-  </head>
-  <body>
-    <div id="root"></div>
-    <script type="module" src="/src/main.jsx"></script>
-  </body>
-</html>
+import { useState } from “react”;
+
+// ============================================================
+// INITIAL STATE
+// ============================================================
+const INITIAL_STATE = {
+stock: 48,
+cashBalance: 1500000,
+pricePerGallon: 15000,
+customers: [
+{
+id: “C001”, name: “Budi Santoso”, phone: “081234567890”,
+type: “piutang”,
+balance: 0, gallon_taken: 0,
+dueDate: “2025-07-25”, overdue: false,
+gallonDeposit: 2,
+},
+{
+id: “C002”, name: “Siti Rahayu”, phone: “082345678901”,
+type: “paket”,
+packageQuota: 10, usedQuota: 3,
+packagePaid: 150000, deferredRevenue: 105000,
+gallonDeposit: 1,
+},
+{
+id: “C003”, name: “Ahmad Fauzi”, phone: “083456789012”,
+type: “piutang”,
+balance: 180000, gallon_taken: 6,
+dueDate: “2025-07-10”, overdue: true,
+gallonDeposit: 3,
+},
+],
+transactions: [
+{ id: “T001”, date: “2025-07-08”, customerId: “C003”, customerName: “Ahmad Fauzi”, type: “subscription_takeout”, qty: 6, amount: 180000, note: “Ambil air - tagihan” },
+{ id: “T002”, date: “2025-07-05”, customerId: “C002”, customerName: “Siti Rahayu”, type: “package_purchase”, qty: 10, amount: 150000, note: “Beli paket 10 galon” },
+{ id: “T003”, date: “2025-07-06”, customerId: “C002”, customerName: “Siti Rahayu”, type: “package_usage”, qty: 3, amount: 45000, note: “Ambil air - kuota paket” },
+{ id: “T004”, date: “2025-07-07”, customerId: null, customerName: “Umum”, type: “cash_sale”, qty: 2, amount: 30000, note: “Penjualan tunai” },
+],
+};
+
+// ============================================================
+// HELPERS
+// ============================================================
+const fmt = (n) =>
+new Intl.NumberFormat(“id-ID”, { style: “currency”, currency: “IDR”, minimumFractionDigits: 0 }).format(n);
+const fmtDate = (d) =>
+new Date(d).toLocaleDateString(“id-ID”, { day: “2-digit”, month: “short”, year: “numeric” });
+const today = () => new Date().toISOString().split(“T”)[0];
+const genId = (prefix) => `${prefix}${Date.now().toString().slice(-6)}`;
+
+// ============================================================
+// REDUCER
+// ============================================================
+function reducer(state, action) {
+switch (action.type) {
+case “CASH_SALE”: {
+const tx = { id: action.txId, date: action.date, customerId: null, customerName: “Umum”, type: “cash_sale”, qty: action.qty, amount: action.total, note: `Penjualan tunai ${action.qty} galon` };
+return { …state, stock: state.stock - action.qty, cashBalance: state.cashBalance + action.total, transactions: […state.transactions, tx] };
+}
+case “SUBSCRIPTION_TAKEOUT”: {
+const tx = { id: action.txId, date: action.date, customerId: action.customer.id, customerName: action.customer.name, type: “subscription_takeout”, qty: action.qty, amount: action.total, note: “Ambil air - tagihan langganan” };
+const customers = state.customers.map(c => c.id === action.customer.id ? { …c, balance: c.balance + action.total, gallon_taken: c.gallon_taken + action.qty } : c);
+return { …state, stock: state.stock - action.qty, customers, transactions: […state.transactions, tx] };
+}
+case “PAY_DEBT”: {
+const pay = Math.min(action.amount, action.customer.balance);
+const tx = { id: action.txId, date: action.date, customerId: action.customer.id, customerName: action.customer.name, type: “pay_debt”, qty: 0, amount: pay, note: “Pelunasan piutang” };
+const gallonPaid = action.customer.balance > 0 ? Math.round((pay / action.customer.balance) * action.customer.gallon_taken) : 0;
+const customers = state.customers.map(c => c.id === action.customer.id ? { …c, balance: c.balance - pay, gallon_taken: Math.max(0, c.gallon_taken - gallonPaid), overdue: (c.balance - pay) > 0 ? c.overdue : false } : c);
+return { …state, cashBalance: state.cashBalance + pay, customers, transactions: […state.transactions, tx] };
+}
+case “PACKAGE_USAGE”: {
+const remaining = action.customer.packageQuota - action.customer.usedQuota;
+const revenuePerGallon = remaining > 0 ? action.customer.deferredRevenue / remaining : 0;
+const recognizedRevenue = action.qty * revenuePerGallon;
+const tx = { id: action.txId, date: action.date, customerId: action.customer.id, customerName: action.customer.name, type: “package_usage”, qty: action.qty, amount: recognizedRevenue, note: “Penggunaan kuota paket” };
+const customers = state.customers.map(c => c.id === action.customer.id ? { …c, usedQuota: c.usedQuota + action.qty, deferredRevenue: Math.max(0, c.deferredRevenue - recognizedRevenue) } : c);
+return { …state, stock: state.stock - action.qty, customers, transactions: […state.transactions, tx] };
+}
+case “ADD_CUSTOMER”:
+return { …state, customers: […state.customers, action.customer] };
+case “NEW_PACKAGE_CUSTOMER”: {
+const tx = { id: action.txId, date: action.date, customerId: action.customer.id, customerName: action.customer.name, type: “package_purchase”, qty: action.customer.packageQuota, amount: action.amount, note: “Pembelian paket baru” };
+return { …state, cashBalance: state.cashBalance + action.amount, customers: […state.customers, action.customer], transactions: […state.transactions, tx] };
+}
+case “TOP_UP_PACKAGE”: {
+const tx = { id: action.txId, date: action.date, customerId: action.customer.id, customerName: action.customer.name, type: “package_purchase”, qty: action.qty, amount: action.amount, note: “Top up paket” };
+const customers = state.customers.map(c => c.id === action.customer.id ? { …c, packageQuota: c.packageQuota + action.qty, deferredRevenue: c.deferredRevenue + action.amount } : c);
+return { …state, cashBalance: state.cashBalance + action.amount, customers, transactions: […state.transactions, tx] };
+}
+default:
+return state;
+}
+}
+
+// ============================================================
+// UI PRIMITIVES
+// ============================================================
+function Badge({ color, children }) {
+const colors = {
+green: “bg-emerald-100 text-emerald-700 border-emerald-200”,
+red: “bg-red-100 text-red-700 border-red-200”,
+amber: “bg-amber-100 text-amber-700 border-amber-200”,
+blue: “bg-blue-100 text-blue-700 border-blue-200”,
+gray: “bg-gray-100 text-gray-600 border-gray-200”,
+violet: “bg-violet-100 text-violet-700 border-violet-200”,
+};
+return <span className={`text-xs font-semibold px-2 py-0.5 rounded-full border ${colors[color] || colors.gray}`}>{children}</span>;
+}
+
+function Card({ children, className = “” }) {
+return <div className={`bg-white rounded-2xl border border-gray-100 shadow-sm ${className}`}>{children}</div>;
+}
+
+function StatCard({ icon, label, value, sub, color = “blue” }) {
+const accents = { blue: “from-blue-500 to-blue-600”, green: “from-emerald-500 to-emerald-600”, amber: “from-amber-500 to-amber-600”, red: “from-red-500 to-red-600”, violet: “from-violet-500 to-violet-600” };
+return (
+<Card className="p-4 flex items-start gap-3">
+<div className={`w-10 h-10 rounded-xl bg-gradient-to-br ${accents[color]} flex items-center justify-center text-white text-lg flex-shrink-0`}>{icon}</div>
+<div>
+<p className="text-xs text-gray-500 font-medium">{label}</p>
+<p className="text-lg font-bold text-gray-800 leading-tight">{value}</p>
+{sub && <p className="text-xs text-gray-400 mt-0.5">{sub}</p>}
+</div>
+</Card>
+);
+}
+
+// ============================================================
+// MODAL: KASIR
+// ============================================================
+function KasirModal({ state, dispatch, onClose }) {
+const [mode, setMode] = useState(“cash”);
+const [searchQ, setSearchQ] = useState(””);
+const [selectedCustomer, setSelectedCustomer] = useState(null);
+const [qty, setQty] = useState(1);
+const [result, setResult] = useState(null);
+
+const price = state.pricePerGallon;
+const total = qty * price;
+
+const filteredCustomers = state.customers.filter(c => {
+const match = c.name.toLowerCase().includes(searchQ.toLowerCase()) || c.phone.includes(searchQ);
+if (mode === “subscription”) return match && c.type === “piutang”;
+if (mode === “package”) return match && c.type === “paket”;
+return match;
+});
+
+const canProceed = () => {
+if (qty < 1 || qty > state.stock) return false;
+if (mode === “cash”) return true;
+if (!selectedCustomer) return false;
+if (mode === “package”) return qty <= (selectedCustomer.packageQuota - selectedCustomer.usedQuota);
+return true;
+};
+
+const handleSubmit = () => {
+const txId = genId(“T”), d = today();
+if (mode === “cash”) {
+dispatch({ type: “CASH_SALE”, qty, total, txId, date: d });
+setResult({ title: “✅ Penjualan Tunai Berhasil”, details: [`${qty} galon × ${fmt(price)}`, `Total: ${fmt(total)}`] });
+} else if (mode === “subscription”) {
+dispatch({ type: “SUBSCRIPTION_TAKEOUT”, customer: selectedCustomer, qty, total, txId, date: d });
+setResult({ title: “📋 Masuk Tagihan Langganan”, details: [`${qty} galon → ${selectedCustomer.name}`, `Piutang +${fmt(total)}`, `Stok berkurang ${qty} galon`] });
+} else {
+dispatch({ type: “PACKAGE_USAGE”, customer: selectedCustomer, qty, total, txId, date: d });
+setResult({ title: “🎟️ Kuota Paket Digunakan”, details: [`${qty} galon dari kuota ${selectedCustomer.name}`, `Stok berkurang ${qty} galon`] });
+}
+};
+
+if (result) return (
+<div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4">
+<Card className="p-6 w-full max-w-sm text-center">
+<div className="text-4xl mb-3">🎉</div>
+<h3 className="text-lg font-bold text-gray-800 mb-2">{result.title}</h3>
+{result.details.map((d, i) => <p key={i} className="text-sm text-gray-600">{d}</p>)}
+<button onClick={onClose} className="mt-5 w-full bg-blue-600 text-white rounded-xl py-2.5 font-semibold">Selesai</button>
+</Card>
+</div>
+);
+
+return (
+<div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4 overflow-y-auto">
+<Card className="p-5 w-full max-w-md my-4">
+<div className="flex items-center justify-between mb-4">
+<h2 className="text-lg font-bold text-gray-800">🧾 Kasir</h2>
+<button onClick={onClose} className="text-gray-400 text-xl">✕</button>
+</div>
+<div className="grid grid-cols-3 gap-2 mb-4">
+{[{ key: “cash”, label: “💵 Tunai”, desc: “Bayar langsung” }, { key: “subscription”, label: “📋 Tagihan”, desc: “Piutang” }, { key: “package”, label: “🎟️ Paket”, desc: “Kuota” }].map(m => (
+<button key={m.key} onClick={() => { setMode(m.key); setSelectedCustomer(null); setSearchQ(””); }}
+className={`rounded-xl p-2.5 border-2 text-center transition-all ${mode === m.key ? "border-blue-500 bg-blue-50" : "border-gray-200 hover:border-gray-300"}`}>
+<div className="text-sm font-bold text-gray-700">{m.label}</div>
+<div className="text-[10px] text-gray-400">{m.desc}</div>
+</button>
+))}
+</div>
+
+```
+    {mode !== "cash" && (
+      <div className="mb-4">
+        <label className="text-xs font-semibold text-gray-600 mb-1 block">Cari Pelanggan</label>
+        <input value={searchQ} onChange={e => { setSearchQ(e.target.value); setSelectedCustomer(null); }}
+          placeholder="Nama atau No. WhatsApp..."
+          className="w-full border border-gray-200 rounded-xl px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-300" />
+        {searchQ.length > 0 && (
+          <div className="mt-1 border border-gray-200 rounded-xl overflow-hidden max-h-40 overflow-y-auto">
+            {filteredCustomers.length === 0
+              ? <div className="px-3 py-2 text-sm text-gray-400 italic">Tidak ditemukan</div>
+              : filteredCustomers.map(c => (
+                <button key={c.id} onClick={() => { setSelectedCustomer(c); setSearchQ(c.name); }}
+                  className="w-full text-left px-3 py-2 text-sm hover:bg-blue-50 flex items-center justify-between border-b last:border-0">
+                  <div>
+                    <div className="font-semibold text-gray-700">{c.name}</div>
+                    <div className="text-xs text-gray-400">{c.phone}</div>
+                  </div>
+                  {mode === "subscription" && <Badge color="amber">Piutang {fmt(c.balance)}</Badge>}
+                  {mode === "package" && <Badge color="violet">Sisa {c.packageQuota - c.usedQuota} gln</Badge>}
+                </button>
+              ))}
+          </div>
+        )}
+      </div>
+    )}
+
+    {selectedCustomer && mode === "subscription" && (
+      <div className="bg-amber-50 border border-amber-200 rounded-xl p-3 mb-4 text-sm">
+        <div className="font-semibold text-amber-800">{selectedCustomer.name}</div>
+        <div className="text-amber-700 text-xs mt-1">Piutang: <strong>{fmt(selectedCustomer.balance)}</strong> | Galon diambil: <strong>{selectedCustomer.gallon_taken}</strong></div>
+        {selectedCustomer.overdue && <div className="text-red-600 text-xs mt-1 font-semibold">⚠️ Jatuh tempo terlampaui!</div>}
+      </div>
+    )}
+    {selectedCustomer && mode === "package" && (
+      <div className="bg-violet-50 border border-violet-200 rounded-xl p-3 mb-4 text-sm">
+        <div className="font-semibold text-violet-800">{selectedCustomer.name}</div>
+        <div className="text-violet-700 text-xs mt-1">Sisa kuota: <strong>{selectedCustomer.packageQuota - selectedCustomer.usedQuota} galon</strong></div>
+      </div>
+    )}
+
+    <div className="mb-4">
+      <label className="text-xs font-semibold text-gray-600 mb-1 block">Jumlah Galon</label>
+      <div className="flex items-center gap-3">
+        <button onClick={() => setQty(q => Math.max(1, q - 1))} className="w-10 h-10 rounded-xl bg-gray-100 font-bold text-gray-600 hover:bg-gray-200 text-xl">−</button>
+        <span className="text-2xl font-bold text-gray-800 w-12 text-center">{qty}</span>
+        <button onClick={() => setQty(q => q + 1)} className="w-10 h-10 rounded-xl bg-gray-100 font-bold text-gray-600 hover:bg-gray-200 text-xl">+</button>
+        <span className="text-sm text-gray-400 ml-1">Stok: {state.stock}</span>
+      </div>
+    </div>
+
+    <div className="bg-gray-50 rounded-xl p-3 mb-4">
+      <div className="flex justify-between text-sm text-gray-600">
+        <span>{qty} × {fmt(price)}</span>
+        <span className="font-bold text-gray-800">{fmt(total)}</span>
+      </div>
+      <div className="text-xs text-gray-400 mt-1">
+        {mode === "cash" && "→ Kas bertambah · Stok berkurang · Pendapatan diakui"}
+        {mode === "subscription" && "→ Piutang bertambah · Stok berkurang · Pendapatan diakui"}
+        {mode === "package" && "→ Kuota berkurang · Stok berkurang · Kewajiban berkurang"}
+      </div>
+    </div>
+
+    <button onClick={handleSubmit} disabled={!canProceed()}
+      className={`w-full py-3 rounded-xl font-bold text-white transition-all ${canProceed() ? "bg-blue-600 hover:bg-blue-700" : "bg-gray-300 cursor-not-allowed"}`}>
+      {mode === "cash" && "💵 Proses Penjualan Tunai"}
+      {mode === "subscription" && "📋 Masukkan ke Tagihan"}
+      {mode === "package" && "🎟️ Gunakan Kuota Paket"}
+    </button>
+  </Card>
+</div>
+```
+
+);
+}
+
+// ============================================================
+// MODAL: PELUNASAN
+// ============================================================
+function PelunasanModal({ state, dispatch, onClose }) {
+const [selectedCustomer, setSelectedCustomer] = useState(null);
+const [amount, setAmount] = useState(””);
+const [result, setResult] = useState(null);
+const debtors = state.customers.filter(c => c.type === “piutang” && c.balance > 0);
+
+const handleSubmit = () => {
+const pay = parseInt(amount);
+if (!pay || pay <= 0 || !selectedCustomer) return;
+dispatch({ type: “PAY_DEBT”, customer: selectedCustomer, amount: pay, txId: genId(“T”), date: today() });
+setResult({ name: selectedCustomer.name, amount: pay, remaining: Math.max(0, selectedCustomer.balance - pay) });
+};
+
+if (result) return (
+<div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4">
+<Card className="p-6 w-full max-w-sm text-center">
+<div className="text-4xl mb-3">💰</div>
+<h3 className="text-lg font-bold text-gray-800">Pelunasan Berhasil!</h3>
+<p className="text-sm text-gray-600 mt-2">Cash In: <strong>{fmt(result.amount)}</strong></p>
+<p className="text-sm text-gray-600">Sisa piutang {result.name}: <strong>{fmt(result.remaining)}</strong></p>
+<p className="text-xs text-gray-400 mt-2">Kas bertambah · Piutang berkurang</p>
+<button onClick={onClose} className="mt-5 w-full bg-emerald-600 text-white rounded-xl py-2.5 font-semibold">Selesai</button>
+</Card>
+</div>
+);
+
+return (
+<div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4">
+<Card className="p-5 w-full max-w-md">
+<div className="flex items-center justify-between mb-4">
+<h2 className="text-lg font-bold text-gray-800">💰 Pelunasan Piutang</h2>
+<button onClick={onClose} className="text-gray-400 text-xl">✕</button>
+</div>
+<div className="mb-4">
+<label className="text-xs font-semibold text-gray-600 mb-2 block">Pilih Pelanggan</label>
+{debtors.length === 0
+? <p className="text-sm text-gray-400 italic">Tidak ada piutang aktif.</p>
+: <div className="space-y-2">
+{debtors.map(c => (
+<button key={c.id} onClick={() => { setSelectedCustomer(c); setAmount(String(c.balance)); }}
+className={`w-full text-left p-3 rounded-xl border-2 transition-all ${selectedCustomer?.id === c.id ? "border-emerald-500 bg-emerald-50" : "border-gray-200 hover:border-gray-300"}`}>
+<div className="flex justify-between items-center">
+<div>
+<div className="font-semibold text-sm text-gray-700">{c.name}</div>
+<div className="text-xs text-gray-400">{c.phone}</div>
+</div>
+<div className="text-right">
+<div className="font-bold text-red-600">{fmt(c.balance)}</div>
+{c.overdue && <Badge color="red">Jatuh Tempo</Badge>}
+</div>
+</div>
+</button>
+))}
+</div>
+}
+</div>
+{selectedCustomer && (
+<div className="mb-4">
+<label className="text-xs font-semibold text-gray-600 mb-1 block">Jumlah Pembayaran (Rp)</label>
+<input type=“number” value={amount} onChange={e => setAmount(e.target.value)}
+className=“w-full border border-gray-200 rounded-xl px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-emerald-300” />
+</div>
+)}
+<button onClick={handleSubmit} disabled={!selectedCustomer || !amount}
+className={`w-full py-3 rounded-xl font-bold text-white ${selectedCustomer && amount ? "bg-emerald-600 hover:bg-emerald-700" : "bg-gray-300 cursor-not-allowed"}`}>
+Konfirmasi Pelunasan
+</button>
+</Card>
+</div>
+);
+}
+
+// ============================================================
+// MODAL: BELI PAKET
+// ============================================================
+function BeliPaketModal({ state, dispatch, onClose }) {
+const [name, setName] = useState(””), [phone, setPhone] = useState(””), [gallon, setGallon] = useState(10), [result, setResult] = useState(null);
+const total = gallon * state.pricePerGallon;
+
+const handleSubmit = () => {
+const existing = state.customers.find(c => c.phone === phone && c.type === “paket”);
+if (existing) {
+dispatch({ type: “TOP_UP_PACKAGE”, customer: existing, qty: gallon, amount: total, date: today(), txId: genId(“T”) });
+setResult({ name: existing.name, gallon, total, type: “topup” });
+} else {
+const newCust = { id: genId(“C”), name, phone, type: “paket”, packageQuota: gallon, usedQuota: 0, packagePaid: total, deferredRevenue: total, gallonDeposit: 0 };
+dispatch({ type: “NEW_PACKAGE_CUSTOMER”, customer: newCust, amount: total, date: today(), txId: genId(“T”) });
+setResult({ name, gallon, total, type: “new” });
+}
+};
+
+if (result) return (
+<div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4">
+<Card className="p-6 w-full max-w-sm text-center">
+<div className="text-4xl mb-3">🎟️</div>
+<h3 className="text-lg font-bold text-gray-800">{result.type === “new” ? “Paket Baru Dibuat!” : “Paket Di-Top Up!”}</h3>
+<p className="text-sm text-gray-600 mt-2">{result.name} · {result.gallon} galon</p>
+<p className="text-sm text-gray-600">Cash In: <strong>{fmt(result.total)}</strong></p>
+<p className="text-xs text-gray-400 mt-2">Kas bertambah · Dicatat sebagai Kewajiban</p>
+<button onClick={onClose} className="mt-5 w-full bg-violet-600 text-white rounded-xl py-2.5 font-semibold">Selesai</button>
+</Card>
+</div>
+);
+
+return (
+<div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4">
+<Card className="p-5 w-full max-w-md">
+<div className="flex items-center justify-between mb-4">
+<h2 className="text-lg font-bold text-gray-800">🎟️ Beli / Top Up Paket</h2>
+<button onClick={onClose} className="text-gray-400 text-xl">✕</button>
+</div>
+<div className="space-y-3 mb-4">
+<div>
+<label className="text-xs font-semibold text-gray-600 mb-1 block">No. WhatsApp</label>
+<input value={phone} onChange={e => setPhone(e.target.value)} placeholder=“08xxxxxxxxxx” type=“tel”
+className=“w-full border border-gray-200 rounded-xl px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-violet-300” />
+</div>
+<div>
+<label className="text-xs font-semibold text-gray-600 mb-1 block">Nama Pelanggan</label>
+<input value={name} onChange={e => setName(e.target.value)} placeholder=“Nama lengkap”
+className=“w-full border border-gray-200 rounded-xl px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-violet-300” />
+</div>
+<div>
+<label className="text-xs font-semibold text-gray-600 mb-1 block">Jumlah Galon Paket</label>
+<div className="flex gap-3">
+{[5, 10, 20].map(n => (
+<button key={n} onClick={() => setGallon(n)}
+className={`flex-1 py-3 rounded-xl border-2 font-semibold text-sm transition-all ${gallon === n ? "border-violet-500 bg-violet-50 text-violet-700" : "border-gray-200 text-gray-600"}`}>
+{n} gln
+</button>
+))}
+</div>
+</div>
+</div>
+<div className="bg-violet-50 rounded-xl p-3 mb-4">
+<div className="flex justify-between text-sm">
+<span className="text-gray-600">Total Bayar</span>
+<span className="font-bold text-violet-700">{fmt(total)}</span>
+</div>
+<p className="text-xs text-gray-400 mt-1">Kas +{fmt(total)} · Kewajiban +{fmt(total)}</p>
+</div>
+<button onClick={handleSubmit} disabled={!name || !phone}
+className={`w-full py-3 rounded-xl font-bold text-white ${name && phone ? "bg-violet-600 hover:bg-violet-700" : "bg-gray-300 cursor-not-allowed"}`}>
+Konfirmasi Pembelian Paket
+</button>
+</Card>
+</div>
+);
+}
+
+// ============================================================
+// PAGE: DASHBOARD
+// ============================================================
+function Dashboard({ state }) {
+const totalPiutang = state.customers.filter(c => c.type === “piutang”).reduce((s, c) => s + c.balance, 0);
+const totalKewajiban = state.customers.filter(c => c.type === “paket”).reduce((s, c) => s + c.deferredRevenue, 0);
+const totalGalonDeposit = state.customers.reduce((s, c) => s + (c.gallonDeposit || 0), 0);
+const overdueCount = state.customers.filter(c => c.overdue).length;
+
+return (
+<div className="space-y-5">
+<div>
+<h2 className="text-xl font-bold text-gray-800">Dashboard</h2>
+<p className="text-sm text-gray-400">Ringkasan keuangan & operasional</p>
+</div>
+
+```
+  {overdueCount > 0 && (
+    <div className="bg-red-50 border border-red-200 rounded-2xl p-4 flex items-start gap-3">
+      <span className="text-2xl">🚨</span>
+      <div>
+        <p className="font-bold text-red-700">{overdueCount} Pelanggan Jatuh Tempo!</p>
+        <p className="text-sm text-red-600">Segera tagih melalui halaman Tagihan.</p>
+      </div>
+    </div>
+  )}
+
+  <div className="grid grid-cols-2 gap-3">
+    <StatCard icon="💵" label="Saldo Kas" value={fmt(state.cashBalance)} color="green" />
+    <StatCard icon="🪣" label="Stok Air" value={`${state.stock} galon`} sub={state.stock < 10 ? "⚠️ Hampir habis!" : "Aman"} color={state.stock < 10 ? "red" : "blue"} />
+    <StatCard icon="📋" label="Total Piutang" value={fmt(totalPiutang)} sub="Belum dibayar" color="amber" />
+    <StatCard icon="🎟️" label="Kewajiban Paket" value={fmt(totalKewajiban)} sub="Kuota belum diambil" color="violet" />
+  </div>
+
+  <Card className="p-4">
+    <h3 className="font-bold text-gray-700 mb-3 text-sm">⚖️ Neraca Singkat</h3>
+    <div className="grid grid-cols-2 gap-4 text-sm">
+      <div>
+        <p className="font-semibold text-gray-400 text-xs uppercase tracking-wide mb-2">ASET</p>
+        <div className="space-y-1.5">
+          {[["Kas", fmt(state.cashBalance)], ["Piutang Usaha", fmt(totalPiutang)], [`Stok (${state.stock} gln)`, fmt(state.stock * state.pricePerGallon)], ["Galon di Pelanggan", `${totalGalonDeposit} unit`]].map(([k, v]) => (
+            <div key={k} className="flex justify-between text-xs">
+              <span className="text-gray-500">{k}</span>
+              <span className="font-semibold text-gray-800">{v}</span>
+            </div>
+          ))}
+        </div>
+      </div>
+      <div>
+        <p className="font-semibold text-gray-400 text-xs uppercase tracking-wide mb-2">KEWAJIBAN</p>
+        <div className="flex justify-between text-xs">
+          <span className="text-gray-500">Pend. Ditangguhkan</span>
+          <span className="font-semibold text-gray-800">{fmt(totalKewajiban)}</span>
+        </div>
+      </div>
+    </div>
+  </Card>
+
+  <Card className="p-4">
+    <h3 className="font-bold text-gray-700 mb-3 text-sm">🕐 Transaksi Terkini</h3>
+    <div className="space-y-0">
+      {[...state.transactions].reverse().slice(0, 6).map(t => (
+        <div key={t.id} className="flex items-center justify-between py-2 border-b border-gray-50 last:border-0">
+          <div>
+            <div className="font-medium text-gray-700 text-sm">{t.customerName}</div>
+            <div className="text-xs text-gray-400">{t.note} · {fmtDate(t.date)}</div>
+          </div>
+          <div className="text-right ml-2 flex-shrink-0">
+            <div className="font-bold text-gray-800 text-sm">{fmt(t.amount)}</div>
+            <Badge color={t.type === "cash_sale" ? "green" : t.type === "subscription_takeout" ? "amber" : t.type === "pay_debt" ? "green" : "violet"}>
+              {t.type === "cash_sale" ? "Tunai" : t.type === "subscription_takeout" ? "Piutang" : t.type === "pay_debt" ? "Bayar" : t.type === "package_purchase" ? "Paket" : "Kuota"}
+            </Badge>
+          </div>
+        </div>
+      ))}
+    </div>
+  </Card>
+</div>
+```
+
+);
+}
+
+// ============================================================
+// FORM: TAMBAH PELANGGAN
+// ============================================================
+function TambahPelangganForm({ dispatch, onDone }) {
+const [name, setName] = useState(””);
+const [phone, setPhone] = useState(””);
+const [type, setType] = useState(“piutang”);
+const [dueDate, setDueDate] = useState(“25”);
+const [gallon, setGallon] = useState(10);
+const [savedName, setSavedName] = useState(””);
+const [savedPhone, setSavedPhone] = useState(””);
+const [saved, setSaved] = useState(false);
+
+const handleSave = () => {
+if (!name.trim() || !phone.trim()) return;
+const id = genId(“C”);
+const now = new Date();
+const due = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}-${dueDate.padStart(2, "0")}`;
+if (type === “piutang”) {
+dispatch({ type: “ADD_CUSTOMER”, customer: { id, name: name.trim(), phone: phone.trim(), type: “piutang”, balance: 0, gallon_taken: 0, dueDate: due, overdue: false, gallonDeposit: 0 } });
+} else {
+const amount = gallon * 15000;
+dispatch({ type: “NEW_PACKAGE_CUSTOMER”, customer: { id, name: name.trim(), phone: phone.trim(), type: “paket”, packageQuota: gallon, usedQuota: 0, packagePaid: amount, deferredRevenue: amount, gallonDeposit: 0 }, amount, date: today(), txId: genId(“T”) });
+}
+setSavedName(name.trim());
+setSavedPhone(phone.trim());
+setSaved(true);
+};
+
+if (saved) return (
+<Card className="p-6 text-center">
+<div className="text-5xl mb-3">✅</div>
+<p className="text-xl font-bold text-gray-800">{savedName} berhasil ditambahkan!</p>
+<p className="text-gray-500 mt-1 text-base">📱 {savedPhone}</p>
+<div className="flex gap-3 mt-5">
+<button onClick={() => { setName(””); setPhone(””); setType(“piutang”); setSaved(false); setSavedName(””); setSavedPhone(””); }}
+className=“flex-1 py-4 rounded-2xl border-2 border-blue-500 text-blue-600 font-bold text-base”>
++ Tambah Lagi
+</button>
+<button onClick={onDone} className="flex-1 py-4 rounded-2xl bg-blue-600 text-white font-bold text-base">
+Selesai
+</button>
+</div>
+</Card>
+);
+
+return (
+<Card className="p-5">
+<h3 className="text-lg font-bold text-gray-800 mb-5">➕ Tambah Pelanggan Baru</h3>
+
+```
+  <div className="mb-5">
+    <label className="block text-base font-bold text-gray-700 mb-2">👤 Nama Pelanggan</label>
+    <input value={name} onChange={e => setName(e.target.value)} placeholder="Contoh: Pak Budi"
+      className="w-full border-2 border-gray-200 rounded-2xl px-4 py-3 text-lg focus:outline-none focus:border-blue-400" />
+  </div>
+
+  <div className="mb-5">
+    <label className="block text-base font-bold text-gray-700 mb-2">📱 Nomor WhatsApp</label>
+    <input value={phone} onChange={e => setPhone(e.target.value)} placeholder="Contoh: 08123456789" type="tel"
+      className="w-full border-2 border-gray-200 rounded-2xl px-4 py-3 text-lg focus:outline-none focus:border-blue-400" />
+  </div>
+
+  <div className="mb-5">
+    <label className="block text-base font-bold text-gray-700 mb-3">🗂️ Jenis Langganan</label>
+    <div className="grid grid-cols-2 gap-3">
+      <button onClick={() => setType("piutang")}
+        className={`py-4 rounded-2xl border-2 font-bold text-base transition-all ${type === "piutang" ? "border-amber-500 bg-amber-50 text-amber-700" : "border-gray-200 text-gray-500"}`}>
+        📋 Tagihan<br /><span className="text-xs font-normal">Bayar akhir bulan</span>
+      </button>
+      <button onClick={() => setType("paket")}
+        className={`py-4 rounded-2xl border-2 font-bold text-base transition-all ${type === "paket" ? "border-violet-500 bg-violet-50 text-violet-700" : "border-gray-200 text-gray-500"}`}>
+        🎟️ Paket<br /><span className="text-xs font-normal">Bayar di awal</span>
+      </button>
+    </div>
+  </div>
+
+  {type === "piutang" && (
+    <div className="mb-5">
+      <label className="block text-base font-bold text-gray-700 mb-3">📅 Jatuh Tempo Tiap Bulan</label>
+      <div className="flex gap-2 flex-wrap">
+        {["10", "15", "20", "25", "30"].map(d => (
+          <button key={d} onClick={() => setDueDate(d)}
+            className={`px-5 py-3 rounded-2xl border-2 font-bold text-base transition-all ${dueDate === d ? "border-blue-500 bg-blue-50 text-blue-700" : "border-gray-200 text-gray-500"}`}>
+            Tgl {d}
+          </button>
+        ))}
+      </div>
+    </div>
+  )}
+
+  {type === "paket" && (
+    <div className="mb-5">
+      <label className="block text-base font-bold text-gray-700 mb-3">🪣 Jumlah Galon Paket</label>
+      <div className="flex gap-3">
+        {[5, 10, 20].map(n => (
+          <button key={n} onClick={() => setGallon(n)}
+            className={`flex-1 py-4 rounded-2xl border-2 font-bold text-xl transition-all ${gallon === n ? "border-violet-500 bg-violet-50 text-violet-700" : "border-gray-200 text-gray-500"}`}>
+            {n}<br /><span className="text-xs font-normal">galon</span>
+          </button>
+        ))}
+      </div>
+      <p className="text-sm text-gray-400 mt-2 text-center">Bayar sekarang: <strong>{fmt(gallon * 15000)}</strong></p>
+    </div>
+  )}
+
+  <button onClick={handleSave} disabled={!name.trim() || !phone.trim()}
+    className={`w-full py-4 rounded-2xl font-bold text-xl transition-all ${name.trim() && phone.trim() ? "bg-blue-600 text-white" : "bg-gray-200 text-gray-400 cursor-not-allowed"}`}>
+    💾 Simpan Pelanggan
+  </button>
+</Card>
+```
+
+);
+}
+
+// ============================================================
+// PAGE: PELANGGAN
+// ============================================================
+function PelangganPage({ state, dispatch }) {
+const [tab, setTab] = useState(“daftar”);
+const [listTab, setListTab] = useState(“piutang”);
+const filtered = state.customers.filter(c => c.type === listTab);
+
+return (
+<div className="space-y-4">
+<div>
+<h2 className="text-xl font-bold text-gray-800">Pelanggan</h2>
+<p className="text-sm text-gray-400">Daftar & tambah pelanggan langganan</p>
+</div>
+
+```
+  <div className="flex gap-2">
+    <button onClick={() => setTab("tambah")}
+      className={`flex-1 py-3 rounded-2xl border-2 font-bold text-base transition-all ${tab === "tambah" ? "border-blue-500 bg-blue-50 text-blue-700" : "border-gray-200 text-gray-500"}`}>
+      ➕ Tambah Pelanggan
+    </button>
+    <button onClick={() => setTab("daftar")}
+      className={`flex-1 py-3 rounded-2xl border-2 font-bold text-base transition-all ${tab === "daftar" ? "border-gray-700 bg-gray-50 text-gray-700" : "border-gray-200 text-gray-500"}`}>
+      📋 Daftar
+    </button>
+  </div>
+
+  {tab === "tambah" && <TambahPelangganForm dispatch={dispatch} onDone={() => setTab("daftar")} />}
+
+  {tab === "daftar" && (
+    <>
+      <div className="flex gap-2">
+        <button onClick={() => setListTab("piutang")}
+          className={`px-4 py-2 rounded-xl text-sm font-semibold border-2 transition-all ${listTab === "piutang" ? "border-amber-500 bg-amber-50 text-amber-700" : "border-gray-200 text-gray-600"}`}>
+          📋 Tagihan ({state.customers.filter(c => c.type === "piutang").length})
+        </button>
+        <button onClick={() => setListTab("paket")}
+          className={`px-4 py-2 rounded-xl text-sm font-semibold border-2 transition-all ${listTab === "paket" ? "border-violet-500 bg-violet-50 text-violet-700" : "border-gray-200 text-gray-600"}`}>
+          🎟️ Paket ({state.customers.filter(c => c.type === "paket").length})
+        </button>
+      </div>
+
+      {filtered.length === 0 ? (
+        <Card className="p-8 text-center">
+          <div className="text-4xl mb-2">👤</div>
+          <p className="text-gray-500">Belum ada pelanggan.<br />Tekan "Tambah Pelanggan" di atas.</p>
+        </Card>
+      ) : (
+        <div className="space-y-3">
+          {filtered.map(c => (
+            <Card key={c.id} className="p-4">
+              <div className="flex items-start justify-between mb-2">
+                <div>
+                  <div className="font-bold text-gray-800 text-base">{c.name}</div>
+                  <div className="text-sm text-gray-400">📱 {c.phone}</div>
+                </div>
+                {c.overdue && <Badge color="red">Jatuh Tempo</Badge>}
+              </div>
+
+              {c.type === "piutang" && (
+                <>
+                  <div className="bg-amber-50 rounded-xl p-3 mb-2">
+                    <div className="flex justify-between text-sm mb-1">
+                      <span className="text-gray-600">Piutang Outstanding</span>
+                      <span className="font-bold text-amber-700">{fmt(c.balance)}</span>
+                    </div>
+                    <div className="text-xs text-gray-400">Galon diambil: {c.gallon_taken} galon</div>
+                  </div>
+                  <div className="text-xs text-gray-400">Jatuh Tempo: {fmtDate(c.dueDate)} · Galon pinjaman: {c.gallonDeposit} unit</div>
+                </>
+              )}
+
+              {c.type === "paket" && (
+                <div className="bg-violet-50 rounded-xl p-3">
+                  <div className="flex justify-between text-sm mb-1">
+                    <span className="text-gray-600">Sisa Kuota</span>
+                    <span className="font-bold text-violet-700">{c.packageQuota - c.usedQuota} / {c.packageQuota} galon</span>
+                  </div>
+                  <div className="w-full bg-violet-200 rounded-full h-1.5">
+                    <div className="bg-violet-500 h-1.5 rounded-full" style={{ width: `${((c.packageQuota - c.usedQuota) / c.packageQuota) * 100}%` }} />
+                  </div>
+                  <div className="text-xs text-gray-400 mt-1">Kewajiban tersisa: {fmt(c.deferredRevenue)} · Galon pinjaman: {c.gallonDeposit} unit</div>
+                  {(c.packageQuota - c.usedQuota) <= 2 && (
+                    <div className="text-amber-600 text-xs font-semibold mt-1">⚠️ Kuota hampir habis!</div>
+                  )}
+                </div>
+              )}
+            </Card>
+          ))}
+        </div>
+      )}
+    </>
+  )}
+</div>
+```
+
+);
+}
+
+// ============================================================
+// PAGE: TAGIHAN
+// ============================================================
+function TagihanPage({ state }) {
+const overdue = state.customers.filter(c => c.type === “piutang” && c.balance > 0);
+return (
+<div className="space-y-4">
+<div>
+<h2 className="text-xl font-bold text-gray-800">Daftar Tagihan</h2>
+<p className="text-sm text-gray-400">Reminder piutang pelanggan langganan</p>
+</div>
+{overdue.length === 0 ? (
+<Card className="p-8 text-center">
+<div className="text-4xl mb-2">🎉</div>
+<p className="font-semibold text-gray-700">Semua piutang sudah lunas!</p>
+</Card>
+) : (
+<div className="space-y-3">
+{overdue.map(c => (
+<Card key={c.id} className={`p-4 ${c.overdue ? "border-red-200 bg-red-50/30" : ""}`}>
+<div className="flex items-start justify-between mb-2">
+<div>
+<div className="font-bold text-gray-800">{c.name}</div>
+<div className="text-xs text-gray-400">📱 {c.phone}</div>
+</div>
+{c.overdue ? <Badge color="red">🔴 Jatuh Tempo</Badge> : <Badge color="amber">🟡 Berjalan</Badge>}
+</div>
+<div className="flex justify-between items-center">
+<div className="text-sm text-gray-600">
+<div>Tagihan: <strong className="text-red-600">{fmt(c.balance)}</strong></div>
+<div className="text-xs text-gray-400">Jatuh Tempo: {fmtDate(c.dueDate)}</div>
+</div>
+<a href={`https://wa.me/${c.phone.replace(/^0/, "62")}?text=Halo%20${encodeURIComponent(c.name)}%2C%20tagihan%20air%20Anda%20sebesar%20${encodeURIComponent(fmt(c.balance))}%20sudah%20jatuh%20tempo.%20Mohon%20segera%20dilunasi.%20Terima%20kasih.`}
+target=”_blank” rel=“noopener noreferrer”
+className=“flex items-center gap-1.5 bg-green-500 text-white text-xs font-semibold px-3 py-2 rounded-xl hover:bg-green-600”>
+📲 WhatsApp
+</a>
+</div>
+</Card>
+))}
+</div>
+)}
+</div>
+);
+}
+
+// ============================================================
+// PAGE: LAPORAN
+// ============================================================
+function LaporanPage({ state }) {
+const cashSales = state.transactions.filter(t => t.type === “cash_sale”);
+const packageUsage = state.transactions.filter(t => t.type === “package_usage”);
+const debtPayments = state.transactions.filter(t => t.type === “pay_debt”);
+const packagePurchases = state.transactions.filter(t => t.type === “package_purchase”);
+const subscriptionTakeouts = state.transactions.filter(t => t.type === “subscription_takeout”);
+const sum = arr => arr.reduce((s, t) => s + t.amount, 0);
+const totalRevenue = sum(cashSales) + sum(packageUsage) + sum(subscriptionTakeouts);
+const totalCashIn = sum(cashSales) + sum(debtPayments) + sum(packagePurchases);
+const totalPiutang = state.customers.filter(c => c.type === “piutang”).reduce((s, c) => s + c.balance, 0);
+const totalKewajiban = state.customers.filter(c => c.type === “paket”).reduce((s, c) => s + c.deferredRevenue, 0);
+const totalGalonDeposit = state.customers.reduce((s, c) => s + (c.gallonDeposit || 0), 0);
+
+return (
+<div className="space-y-5">
+<div>
+<h2 className="text-xl font-bold text-gray-800">Laporan Keuangan</h2>
+<p className="text-sm text-gray-400">Laba Rugi + Neraca terpadu</p>
+</div>
+
+```
+  <Card className="p-4">
+    <h3 className="font-bold text-gray-700 mb-3 text-sm flex items-center gap-1">📊 Laba Rugi <span className="text-xs text-gray-400 font-normal">(Accrual Basis)</span></h3>
+    <div className="space-y-2 text-sm">
+      <div className="flex justify-between"><span className="text-gray-600">Penjualan Tunai</span><span className="font-semibold">{fmt(sum(cashSales))}</span></div>
+      <div className="flex justify-between"><span className="text-gray-600">Langganan Piutang (diakui)</span><span className="font-semibold">{fmt(sum(subscriptionTakeouts))}</span></div>
+      <div className="flex justify-between"><span className="text-gray-600">Penggunaan Kuota Paket</span><span className="font-semibold">{fmt(sum(packageUsage))}</span></div>
+      <div className="border-t pt-2 flex justify-between font-bold text-gray-800">
+        <span>Total Pendapatan</span><span className="text-emerald-600">{fmt(totalRevenue)}</span>
+      </div>
+    </div>
+  </Card>
+
+  <Card className="p-4">
+    <h3 className="font-bold text-gray-700 mb-3 text-sm">💵 Arus Kas (Cash Flow)</h3>
+    <div className="space-y-2 text-sm">
+      <div className="flex justify-between"><span className="text-gray-600">Dari Penjualan Tunai</span><span className="font-semibold text-emerald-600">+{fmt(sum(cashSales))}</span></div>
+      <div className="flex justify-between"><span className="text-gray-600">Dari Pelunasan Piutang</span><span className="font-semibold text-emerald-600">+{fmt(sum(debtPayments))}</span></div>
+      <div className="flex justify-between"><span className="text-gray-600">Dari Pembelian Paket</span><span className="font-semibold text-emerald-600">+{fmt(sum(packagePurchases))}</span></div>
+      <div className="border-t pt-2 flex justify-between font-bold text-gray-800">
+        <span>Total Cash In</span><span className="text-emerald-600">{fmt(totalCashIn)}</span>
+      </div>
+    </div>
+  </Card>
+
+  <Card className="p-4">
+    <h3 className="font-bold text-gray-700 mb-3 text-sm">⚖️ Neraca</h3>
+    <div className="grid grid-cols-2 gap-4">
+      <div>
+        <p className="font-semibold text-gray-400 text-xs uppercase mb-2">ASET</p>
+        <div className="space-y-1.5">
+          {[["Kas", fmt(state.cashBalance)], ["Piutang Usaha", fmt(totalPiutang)], [`Stok (${state.stock} gln)`, fmt(state.stock * state.pricePerGallon)], ["Galon Pinjaman", `${totalGalonDeposit} unit`]].map(([k, v]) => (
+            <div key={k} className="flex justify-between text-xs">
+              <span className="text-gray-600">{k}</span>
+              <span className="font-semibold text-gray-800">{v}</span>
+            </div>
+          ))}
+        </div>
+      </div>
+      <div>
+        <p className="font-semibold text-gray-400 text-xs uppercase mb-2">KEWAJIBAN</p>
+        <div className="flex justify-between text-xs">
+          <span className="text-gray-600">Pend. Ditangguhkan</span>
+          <span className="font-semibold text-gray-800">{fmt(totalKewajiban)}</span>
+        </div>
+      </div>
+    </div>
+  </Card>
+
+  <Card className="p-4">
+    <h3 className="font-bold text-gray-700 mb-2 text-sm">🗄️ Skema Database</h3>
+    <div className="text-xs text-gray-500 space-y-1 font-mono bg-gray-50 rounded-xl p-3">
+      <div className="font-bold text-gray-700 mb-1">customers</div>
+      <div>id · name · phone · type (piutang|paket) · due_date</div>
+      <div className="font-bold text-gray-700 mt-2 mb-1">customer_balances</div>
+      <div>customer_id · debt_balance · gallon_taken</div>
+      <div>package_quota · used_quota · deferred_revenue</div>
+      <div className="font-bold text-gray-700 mt-2 mb-1">transactions</div>
+      <div>id · customer_id · type · qty · amount · date</div>
+      <div>type: cash_sale | subscription_takeout | pay_debt</div>
+      <div>     | package_purchase | package_usage | top_up</div>
+      <div className="font-bold text-gray-700 mt-2 mb-1">stock_movements</div>
+      <div>id · tx_id · qty_change · stock_after · date</div>
+      <div className="font-bold text-gray-700 mt-2 mb-1">galon_assets</div>
+      <div>id · customer_id · qty_loaned · date_loaned</div>
+    </div>
+  </Card>
+</div>
+```
+
+);
+}
+
+// ============================================================
+// APP ROOT
+// ============================================================
+export default function App() {
+const [state, setStateRaw] = useState(INITIAL_STATE);
+const dispatch = (action) => setStateRaw(prev => reducer(prev, action));
+const [page, setPage] = useState(“dashboard”);
+const [modal, setModal] = useState(null);
+
+const nav = [
+{ key: “dashboard”, icon: “🏠”, label: “Beranda” },
+{ key: “pelanggan”, icon: “👥”, label: “Pelanggan” },
+{ key: “tagihan”, icon: “🔔”, label: “Tagihan” },
+{ key: “laporan”, icon: “📊”, label: “Laporan” },
+];
+
+const overdueCount = state.customers.filter(c => c.overdue).length;
+
+return (
+<div className="min-h-screen bg-gray-50 flex flex-col max-w-lg mx-auto">
+<div className="bg-white border-b border-gray-100 px-4 py-3 flex items-center justify-between sticky top-0 z-10">
+<div className="flex items-center gap-2">
+<div className="w-8 h-8 bg-gradient-to-br from-blue-500 to-cyan-500 rounded-xl flex items-center justify-center text-white font-bold">💧</div>
+<div>
+<div className="font-bold text-gray-800 text-sm leading-tight">AirKu POS</div>
+<div className="text-[10px] text-gray-400">Depo Air Minum</div>
+</div>
+</div>
+<div className="flex gap-2">
+<button onClick={() => setModal(“paket”)} className=“text-xs bg-violet-100 text-violet-700 font-semibold px-3 py-1.5 rounded-xl”>🎟️ Paket</button>
+<button onClick={() => setModal(“kasir”)} className=“text-xs bg-blue-600 text-white font-semibold px-3 py-1.5 rounded-xl”>🧾 Kasir</button>
+</div>
+</div>
+
+```
+  <div className="flex-1 overflow-y-auto p-4 pb-24">
+    {page === "dashboard" && <Dashboard state={state} />}
+    {page === "pelanggan" && <PelangganPage state={state} dispatch={dispatch} />}
+    {page === "tagihan" && <TagihanPage state={state} />}
+    {page === "laporan" && <LaporanPage state={state} />}
+  </div>
+
+  {page === "tagihan" && (
+    <div className="fixed bottom-20 left-1/2 -translate-x-1/2 w-full max-w-lg px-4 z-10">
+      <button onClick={() => setModal("pelunasan")} className="w-full bg-emerald-600 text-white font-bold py-3 rounded-2xl shadow-lg shadow-emerald-200">
+        💰 Terima Pelunasan Piutang
+      </button>
+    </div>
+  )}
+
+  <div className="fixed bottom-0 left-1/2 -translate-x-1/2 w-full max-w-lg bg-white border-t border-gray-100 flex z-10">
+    {nav.map(n => (
+      <button key={n.key} onClick={() => setPage(n.key)}
+        className={`flex-1 py-3 flex flex-col items-center gap-0.5 transition-all relative ${page === n.key ? "text-blue-600" : "text-gray-400"}`}>
+        <span className="text-lg">{n.icon}</span>
+        <span className="text-[10px] font-medium">{n.label}</span>
+        {n.key === "tagihan" && overdueCount > 0 && (
+          <span className="absolute top-1.5 right-3 w-4 h-4 bg-red-500 text-white text-[9px] font-bold rounded-full flex items-center justify-center">{overdueCount}</span>
+        )}
+      </button>
+    ))}
+  </div>
+
+  {modal === "kasir" && <KasirModal state={state} dispatch={dispatch} onClose={() => setModal(null)} />}
+  {modal === "pelunasan" && <PelunasanModal state={state} dispatch={dispatch} onClose={() => setModal(null)} />}
+  {modal === "paket" && <BeliPaketModal state={state} dispatch={dispatch} onClose={() => setModal(null)} />}
+</div>
+```
+
+);
+}
