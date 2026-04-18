@@ -16,9 +16,6 @@
   <script type="text/babel">
     const { useState, useEffect, useCallback } = React;
 
-    // ============================================================
-    // SUPABASE CONFIG
-    // ============================================================
     const SUPABASE_URL = "https://tfgxupnchvaezomwlwln.supabase.co";
     const SUPABASE_KEY = "sb_publishable_nv0iL_lV1KxGWG13PKI31g_RiX8iiF4";
     const sb = supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
@@ -31,10 +28,572 @@
     const today = () => new Date().toISOString().split("T")[0];
     const genId = p => `${p}${Date.now().toString().slice(-6)}`;
 
+    const CAT_LABEL = { isi_ulang:"💧 Isi Ulang", galon_merk:"🏷️ Galon Bermerk", botolan:"🥤 Botolan/Gelas", gas:"🔥 Gas Elpiji" };
+    const CAT_COLOR = { isi_ulang:"blue", galon_merk:"cyan", botolan:"emerald", gas:"orange" };
+
     // ============================================================
     // DB HELPERS
     // ============================================================
     async function loadAll() {
+      const [{ data: appState }, { data: customers }, { data: transactions }, { data: products }] = await Promise.all([
+        sb.from("app_state").select("*").eq("id",1).single(),
+        sb.from("customers").select("*").order("created_at"),
+        sb.from("transactions").select("*").order("created_at"),
+        sb.from("products").select("*").eq("active",true).order("category").order("name"),
+      ]);
+      return {
+        cashBalance: appState?.cash_balance ?? 0,
+        pricePerGallon: appState?.price_per_gallon ?? 15000,
+        customers: (customers||[]).map(dbToCustomer),
+        transactions: (transactions||[]).map(dbToTx),
+        products: (products||[]),
+      };
+    }
+
+    function dbToCustomer(c) {
+      return { id:c.id, name:c.name, phone:c.phone, type:c.type, balance:c.balance||0, gallon_taken:c.gallon_taken||0, dueDate:c.due_date, overdue:c.overdue||false, gallonDeposit:c.gallon_deposit||0, packageQuota:c.package_quota||0, usedQuota:c.used_quota||0, packagePaid:c.package_paid||0, deferredRevenue:c.deferred_revenue||0 };
+    }
+    function dbToTx(t) {
+      return { id:t.id, date:t.date, customerId:t.customer_id, customerName:t.customer_name, type:t.type, qty:t.qty, amount:t.amount, note:t.note, productName:t.product_name||"" };
+    }
+
+    async function updateAppState(patch) { await sb.from("app_state").update(patch).eq("id",1); }
+    async function upsertCustomer(c) {
+      await sb.from("customers").upsert({ id:c.id, name:c.name, phone:c.phone, type:c.type, balance:c.balance||0, gallon_taken:c.gallon_taken||0, due_date:c.dueDate||null, overdue:c.overdue||false, gallon_deposit:c.gallonDeposit||0, package_quota:c.packageQuota||0, used_quota:c.usedQuota||0, package_paid:c.packagePaid||0, deferred_revenue:c.deferredRevenue||0 });
+    }
+    async function insertTx(t) {
+      await sb.from("transactions").insert({ id:t.id, date:t.date, customer_id:t.customerId||null, customer_name:t.customerName, type:t.type, qty:t.qty, amount:t.amount, note:t.note, product_name:t.productName||"" });
+    }
+    async function updateProductStock(productId, newStock) {
+      await sb.from("products").update({ stock: newStock }).eq("id", productId);
+    }
+    async function upsertProduct(p) {
+      await sb.from("products").upsert({ id:p.id, name:p.name, category:p.category, unit:p.unit, price:p.price, stock:p.stock, active:p.active!==false });
+    }
+
+    // ============================================================
+    // UI PRIMITIVES
+    // ============================================================
+    function Badge({color,children}) {
+      const c={green:"bg-emerald-100 text-emerald-700 border-emerald-200",red:"bg-red-100 text-red-700 border-red-200",amber:"bg-amber-100 text-amber-700 border-amber-200",blue:"bg-blue-100 text-blue-700 border-blue-200",violet:"bg-violet-100 text-violet-700 border-violet-200",cyan:"bg-cyan-100 text-cyan-700 border-cyan-200",orange:"bg-orange-100 text-orange-700 border-orange-200",gray:"bg-gray-100 text-gray-600 border-gray-200"};
+      return <span className={`text-xs font-semibold px-2 py-0.5 rounded-full border ${c[color]||c.gray}`}>{children}</span>;
+    }
+    function Card({children,className=""}) { return <div className={`bg-white rounded-2xl border border-gray-100 shadow-sm ${className}`}>{children}</div>; }
+    function StatCard({icon,label,value,sub,color="blue"}) {
+      const a={blue:"from-blue-500 to-blue-600",green:"from-emerald-500 to-emerald-600",amber:"from-amber-500 to-amber-600",red:"from-red-500 to-red-600",violet:"from-violet-500 to-violet-600"};
+      return <Card className="p-4 flex items-start gap-3"><div className={`w-10 h-10 rounded-xl bg-gradient-to-br ${a[color]} flex items-center justify-center text-white text-lg flex-shrink-0`}>{icon}</div><div><p className="text-xs text-gray-500 font-medium">{label}</p><p className="text-lg font-bold text-gray-800 leading-tight">{value}</p>{sub&&<p className="text-xs text-gray-400 mt-0.5">{sub}</p>}</div></Card>;
+    }
+
+    // ============================================================
+    // MODAL: KASIR TUNAI (semua produk)
+    // ============================================================
+    function KasirModal({state,reload,onClose}) {
+      const [cart,setCart]=useState([]); // [{product, qty}]
+      const [mode,setMode]=useState("tunai"); // tunai | tagihan | paket
+      const [searchQ,setSearchQ]=useState("");
+      const [selCustomer,setSelCustomer]=useState(null);
+      const [result,setResult]=useState(null);
+      const [loading,setLoading]=useState(false);
+
+      const isiUlang=state.products.find(p=>p.category==="isi_ulang");
+      const otherProducts=state.products.filter(p=>p.category!=="isi_ulang");
+
+      const addToCart=(product)=>{
+        setCart(prev=>{
+          const ex=prev.find(i=>i.product.id===product.id);
+          if(ex)return prev.map(i=>i.product.id===product.id?{...i,qty:i.qty+1}:i);
+          return [...prev,{product,qty:1}];
+        });
+      };
+      const removeFromCart=(productId)=>setCart(prev=>prev.filter(i=>i.product.id!==productId));
+      const setQty=(productId,qty)=>{
+        if(qty<=0){removeFromCart(productId);return;}
+        setCart(prev=>prev.map(i=>i.product.id===productId?{...i,qty}:i));
+      };
+
+      const total=cart.reduce((s,i)=>s+i.product.price*i.qty,0);
+
+      const filteredCustomers=state.customers.filter(c=>{
+        const m=c.name.toLowerCase().includes(searchQ.toLowerCase())||c.phone.includes(searchQ);
+        if(mode==="tagihan")return m&&c.type==="piutang";
+        if(mode==="paket")return m&&c.type==="paket";
+        return m;
+      });
+
+      const canProceed=()=>{
+        if(cart.length===0)return false;
+        for(const item of cart){ if(item.qty>item.product.stock)return false; }
+        if(mode!=="tunai"&&!selCustomer)return false;
+        if(mode==="tagihan"){
+          const hasOther=cart.some(i=>i.product.category!=="isi_ulang");
+          if(hasOther)return false;
+        }
+        if(mode==="paket"){
+          const hasOther=cart.some(i=>i.product.category!=="isi_ulang");
+          if(hasOther)return false;
+          const totalQty=cart.reduce((s,i)=>s+i.qty,0);
+          if(totalQty>(selCustomer.packageQuota-selCustomer.usedQuota))return false;
+        }
+        return true;
+      };
+
+      const submit=async()=>{
+        if(!canProceed()||loading)return;
+        setLoading(true);
+        try{
+          const d=today();
+          const stockUpdates=cart.map(i=>updateProductStock(i.product.id,i.product.stock-i.qty));
+
+          if(mode==="tunai"){
+            const txs=cart.map(i=>({id:genId("T"),date:d,customerId:null,customerName:"Umum",type:"cash_sale",qty:i.qty,amount:i.product.price*i.qty,note:`${i.product.name} ×${i.qty}`,productName:i.product.name}));
+            await Promise.all([updateAppState({cash_balance:state.cashBalance+total}),...stockUpdates,...txs.map(insertTx)]);
+            setResult({title:"✅ Penjualan Berhasil",details:[...cart.map(i=>`${i.product.name} ×${i.qty} = ${fmt(i.product.price*i.qty)}`),`Total: ${fmt(total)}`]});
+
+          } else if(mode==="tagihan"){
+            const totalQty=cart.reduce((s,i)=>s+i.qty,0);
+            const updated={...selCustomer,balance:selCustomer.balance+total,gallon_taken:selCustomer.gallon_taken+totalQty};
+            const txs=cart.map(i=>({id:genId("T"),date:d,customerId:selCustomer.id,customerName:selCustomer.name,type:"subscription_takeout",qty:i.qty,amount:i.product.price*i.qty,note:`${i.product.name} ×${i.qty} - tagihan`,productName:i.product.name}));
+            await Promise.all([upsertCustomer(updated),...stockUpdates,...txs.map(insertTx)]);
+            setResult({title:"📋 Masuk Tagihan",details:[`${selCustomer.name}`,`Piutang +${fmt(total)}`]});
+
+          } else if(mode==="paket"){
+            const totalQty=cart.reduce((s,i)=>s+i.qty,0);
+            const rem=selCustomer.packageQuota-selCustomer.usedQuota;
+            const rpg=rem>0?selCustomer.deferredRevenue/rem:0;
+            const rr=totalQty*rpg;
+            const updated={...selCustomer,usedQuota:selCustomer.usedQuota+totalQty,deferredRevenue:Math.max(0,selCustomer.deferredRevenue-rr)};
+            const txs=cart.map(i=>({id:genId("T"),date:d,customerId:selCustomer.id,customerName:selCustomer.name,type:"package_usage",qty:i.qty,amount:i.product.price*i.qty,note:`${i.product.name} ×${i.qty} - kuota`,productName:i.product.name}));
+            await Promise.all([upsertCustomer(updated),...stockUpdates,...txs.map(insertTx)]);
+            setResult({title:"🎟️ Kuota Digunakan",details:[`${selCustomer.name}`,`${totalQty} galon dari kuota`]});
+          }
+          await reload();
+        }catch(e){alert("Gagal: "+e.message);}
+        setLoading(false);
+      };
+
+      if(result)return(<div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4"><Card className="p-6 w-full max-w-sm text-center"><div className="text-4xl mb-3">🎉</div><h3 className="text-lg font-bold text-gray-800 mb-2">{result.title}</h3>{result.details.map((d,i)=><p key={i} className="text-sm text-gray-600">{d}</p>)}<button onClick={onClose} className="mt-5 w-full bg-blue-600 text-white rounded-xl py-2.5 font-semibold">Selesai</button></Card></div>);
+
+      return(
+        <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-2 overflow-y-auto">
+          <Card className="p-4 w-full max-w-md my-2">
+            <div className="flex items-center justify-between mb-3"><h2 className="text-lg font-bold text-gray-800">🧾 Kasir</h2><button onClick={onClose} className="text-gray-400 text-xl">✕</button></div>
+
+            {/* Mode */}
+            <div className="grid grid-cols-3 gap-1.5 mb-3">
+              {[{key:"tunai",label:"💵 Tunai"},{key:"tagihan",label:"📋 Tagihan"},{key:"paket",label:"🎟️ Paket"}].map(m=>(
+                <button key={m.key} onClick={()=>{setMode(m.key);setSelCustomer(null);setSearchQ("");setCart([]);}}
+                  className={`rounded-xl py-2 text-sm font-bold border-2 transition-all ${mode===m.key?"border-blue-500 bg-blue-50 text-blue-700":"border-gray-200 text-gray-600"}`}>{m.label}</button>
+              ))}
+            </div>
+
+            {/* Info mode tagihan/paket */}
+            {mode!=="tunai"&&<p className="text-xs text-amber-600 bg-amber-50 rounded-xl px-3 py-2 mb-3">⚠️ Langganan hanya untuk produk Air Isi Ulang</p>}
+
+            {/* Customer search */}
+            {mode!=="tunai"&&(
+              <div className="mb-3">
+                <input value={searchQ} onChange={e=>{setSearchQ(e.target.value);setSelCustomer(null);}} placeholder="Cari nama atau No. WA pelanggan..." className="w-full border border-gray-200 rounded-xl px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-300"/>
+                {searchQ.length>0&&<div className="mt-1 border border-gray-200 rounded-xl overflow-hidden max-h-32 overflow-y-auto">
+                  {filteredCustomers.length===0?<div className="px-3 py-2 text-sm text-gray-400 italic">Tidak ditemukan</div>:filteredCustomers.map(c=><button key={c.id} onClick={()=>{setSelCustomer(c);setSearchQ(c.name);}} className="w-full text-left px-3 py-2 text-sm hover:bg-blue-50 flex items-center justify-between border-b last:border-0"><div><div className="font-semibold text-gray-700">{c.name}</div><div className="text-xs text-gray-400">{c.phone}</div></div>{mode==="tagihan"&&<Badge color="amber">Piutang {fmt(c.balance)}</Badge>}{mode==="paket"&&<Badge color="violet">Sisa {c.packageQuota-c.usedQuota} gln</Badge>}</button>)}
+                </div>}
+                {selCustomer&&<div className="mt-1 bg-blue-50 rounded-xl px-3 py-2 text-xs text-blue-700 font-semibold">✓ {selCustomer.name} dipilih</div>}
+              </div>
+            )}
+
+            {/* Produk */}
+            <div className="mb-3 max-h-56 overflow-y-auto space-y-2">
+              {/* Air Isi Ulang */}
+              {isiUlang&&<div>
+                <p className="text-xs font-bold text-gray-400 uppercase mb-1">💧 Air Isi Ulang</p>
+                <button onClick={()=>addToCart(isiUlang)} className="w-full flex items-center justify-between bg-blue-50 border border-blue-200 rounded-xl px-3 py-2 hover:bg-blue-100">
+                  <div className="text-left"><div className="font-semibold text-sm text-gray-800">{isiUlang.name}</div><div className="text-xs text-gray-500">Stok: {isiUlang.stock} galon</div></div>
+                  <div className="text-right"><div className="font-bold text-blue-700">{fmt(isiUlang.price)}</div><div className="text-xs text-blue-500">per galon</div></div>
+                </button>
+              </div>}
+
+              {/* Produk lain per kategori */}
+              {["galon_merk","botolan","gas"].map(cat=>{
+                const prods=otherProducts.filter(p=>p.category===cat);
+                if(prods.length===0)return null;
+                return <div key={cat}>
+                  <p className="text-xs font-bold text-gray-400 uppercase mb-1">{CAT_LABEL[cat]}</p>
+                  <div className="space-y-1">
+                    {prods.map(p=><button key={p.id} onClick={()=>addToCart(p)} disabled={mode!=="tunai"} className={`w-full flex items-center justify-between border rounded-xl px-3 py-2 ${mode!=="tunai"?"opacity-40 cursor-not-allowed bg-gray-50 border-gray-200":"bg-white border-gray-200 hover:bg-gray-50"}`}>
+                      <div className="text-left"><div className="font-semibold text-sm text-gray-800">{p.name}</div><div className="text-xs text-gray-500">Stok: {p.stock} {p.unit}</div></div>
+                      <div className="text-right"><div className="font-bold text-gray-700">{fmt(p.price)}</div><div className="text-xs text-gray-400">per {p.unit}</div></div>
+                    </button>)}
+                  </div>
+                </div>;
+              })}
+            </div>
+
+            {/* Keranjang */}
+            {cart.length>0&&<div className="border border-gray-200 rounded-xl p-3 mb-3">
+              <p className="text-xs font-bold text-gray-500 mb-2">🛒 Keranjang</p>
+              <div className="space-y-2">
+                {cart.map(item=><div key={item.product.id} className="flex items-center gap-2">
+                  <div className="flex-1 text-sm text-gray-700 truncate">{item.product.name}</div>
+                  <button onClick={()=>setQty(item.product.id,item.qty-1)} className="w-7 h-7 rounded-lg bg-gray-100 font-bold text-gray-600 text-sm">−</button>
+                  <span className="w-8 text-center font-bold text-sm">{item.qty}</span>
+                  <button onClick={()=>setQty(item.product.id,item.qty+1)} className="w-7 h-7 rounded-lg bg-gray-100 font-bold text-gray-600 text-sm">+</button>
+                  <div className="w-20 text-right text-sm font-semibold text-gray-800">{fmt(item.product.price*item.qty)}</div>
+                </div>)}
+              </div>
+              <div className="border-t mt-2 pt-2 flex justify-between font-bold text-gray-800">
+                <span>Total</span><span className="text-blue-600">{fmt(total)}</span>
+              </div>
+            </div>}
+
+            <button onClick={submit} disabled={!canProceed()||loading} className={`w-full py-3 rounded-xl font-bold text-white ${canProceed()&&!loading?"bg-blue-600 hover:bg-blue-700":"bg-gray-300 cursor-not-allowed"}`}>
+              {loading?"⏳ Menyimpan...":cart.length===0?"Pilih produk dulu":!canProceed()&&mode!=="tunai"&&!selCustomer?"Pilih pelanggan dulu":"✅ Proses Transaksi"}
+            </button>
+          </Card>
+        </div>
+      );
+    }
+
+    // ============================================================
+    // MODAL: PELUNASAN
+    // ============================================================
+    function PelunasanModal({state,reload,onClose}) {
+      const [sel,setSel]=useState(null),[amount,setAmount]=useState(""),[result,setResult]=useState(null),[loading,setLoading]=useState(false);
+      const debtors=state.customers.filter(c=>c.type==="piutang"&&c.balance>0);
+      const submit=async()=>{
+        const pay=parseInt(amount);
+        if(!pay||pay<=0||!sel)return;
+        setLoading(true);
+        try{
+          const actualPay=Math.min(pay,sel.balance);
+          const gp=sel.balance>0?Math.round((actualPay/sel.balance)*sel.gallon_taken):0;
+          const updated={...sel,balance:sel.balance-actualPay,gallon_taken:Math.max(0,sel.gallon_taken-gp),overdue:(sel.balance-actualPay)>0?sel.overdue:false};
+          const tx={id:genId("T"),date:today(),customerId:sel.id,customerName:sel.name,type:"pay_debt",qty:0,amount:actualPay,note:"Pelunasan piutang",productName:""};
+          await Promise.all([updateAppState({cash_balance:state.cashBalance+actualPay}),upsertCustomer(updated),insertTx(tx)]);
+          await reload();
+          setResult({name:sel.name,amount:actualPay,remaining:Math.max(0,sel.balance-actualPay)});
+        }catch(e){alert("Gagal: "+e.message);}
+        setLoading(false);
+      };
+      if(result)return(<div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4"><Card className="p-6 w-full max-w-sm text-center"><div className="text-4xl mb-3">💰</div><h3 className="text-lg font-bold text-gray-800">Pelunasan Berhasil!</h3><p className="text-sm text-gray-600 mt-2">Cash In: <strong>{fmt(result.amount)}</strong></p><p className="text-sm text-gray-600">Sisa piutang {result.name}: <strong>{fmt(result.remaining)}</strong></p><button onClick={onClose} className="mt-5 w-full bg-emerald-600 text-white rounded-xl py-2.5 font-semibold">Selesai</button></Card></div>);
+      return(
+        <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4">
+          <Card className="p-5 w-full max-w-md">
+            <div className="flex items-center justify-between mb-4"><h2 className="text-lg font-bold text-gray-800">💰 Pelunasan Piutang</h2><button onClick={onClose} className="text-gray-400 text-xl">✕</button></div>
+            <div className="mb-4"><label className="text-xs font-semibold text-gray-600 mb-2 block">Pilih Pelanggan</label>
+              {debtors.length===0?<p className="text-sm text-gray-400 italic">Tidak ada piutang aktif.</p>:<div className="space-y-2">{debtors.map(c=><button key={c.id} onClick={()=>{setSel(c);setAmount(String(c.balance));}} className={`w-full text-left p-3 rounded-xl border-2 ${sel&&sel.id===c.id?"border-emerald-500 bg-emerald-50":"border-gray-200"}`}><div className="flex justify-between items-center"><div><div className="font-semibold text-sm text-gray-700">{c.name}</div><div className="text-xs text-gray-400">{c.phone}</div></div><div className="text-right"><div className="font-bold text-red-600">{fmt(c.balance)}</div>{c.overdue&&<Badge color="red">Jatuh Tempo</Badge>}</div></div></button>)}</div>}
+            </div>
+            {sel&&<div className="mb-4"><label className="text-xs font-semibold text-gray-600 mb-1 block">Jumlah Pembayaran (Rp)</label><input type="number" value={amount} onChange={e=>setAmount(e.target.value)} className="w-full border border-gray-200 rounded-xl px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-emerald-300"/></div>}
+            <button onClick={submit} disabled={!sel||!amount||loading} className={`w-full py-3 rounded-xl font-bold text-white ${sel&&amount&&!loading?"bg-emerald-600":"bg-gray-300 cursor-not-allowed"}`}>{loading?"⏳ Menyimpan...":"Konfirmasi Pelunasan"}</button>
+          </Card>
+        </div>
+      );
+    }
+
+    // ============================================================
+    // MODAL: BELI PAKET ISI ULANG
+    // ============================================================
+    function BeliPaketModal({state,reload,onClose}) {
+      const [name,setName]=useState(""),[phone,setPhone]=useState(""),[gallon,setGallon]=useState(10),[result,setResult]=useState(null),[loading,setLoading]=useState(false);
+      const isiUlang=state.products.find(p=>p.category==="isi_ulang");
+      const price=isiUlang?.price||15000;
+      const total=gallon*price;
+      const submit=async()=>{
+        setLoading(true);
+        try{
+          const ex=state.customers.find(c=>c.phone===phone&&c.type==="paket");
+          const txId=genId("T"),d=today();
+          if(ex){
+            const updated={...ex,packageQuota:ex.packageQuota+gallon,deferredRevenue:ex.deferredRevenue+total};
+            const tx={id:txId,date:d,customerId:ex.id,customerName:ex.name,type:"package_purchase",qty:gallon,amount:total,note:"Top up paket",productName:"Air Isi Ulang"};
+            await Promise.all([updateAppState({cash_balance:state.cashBalance+total}),upsertCustomer(updated),insertTx(tx)]);
+            setResult({name:ex.name,gallon,total,type:"topup"});
+          }else{
+            const nc={id:genId("C"),name,phone,type:"paket",balance:0,gallon_taken:0,dueDate:null,overdue:false,gallonDeposit:0,packageQuota:gallon,usedQuota:0,packagePaid:total,deferredRevenue:total};
+            const tx={id:txId,date:d,customerId:nc.id,customerName:nc.name,type:"package_purchase",qty:gallon,amount:total,note:"Pembelian paket baru",productName:"Air Isi Ulang"};
+            await Promise.all([updateAppState({cash_balance:state.cashBalance+total}),upsertCustomer(nc),insertTx(tx)]);
+            setResult({name,gallon,total,type:"new"});
+          }
+          await reload();
+        }catch(e){alert("Gagal: "+e.message);}
+        setLoading(false);
+      };
+      if(result)return(<div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4"><Card className="p-6 w-full max-w-sm text-center"><div className="text-4xl mb-3">🎟️</div><h3 className="text-lg font-bold text-gray-800">{result.type==="new"?"Paket Baru Dibuat!":"Paket Di-Top Up!"}</h3><p className="text-sm text-gray-600 mt-2">{result.name} · {result.gallon} galon</p><p className="text-sm text-gray-600">Cash In: <strong>{fmt(result.total)}</strong></p><button onClick={onClose} className="mt-5 w-full bg-violet-600 text-white rounded-xl py-2.5 font-semibold">Selesai</button></Card></div>);
+      return(
+        <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4">
+          <Card className="p-5 w-full max-w-md">
+            <div className="flex items-center justify-between mb-4"><h2 className="text-lg font-bold text-gray-800">🎟️ Beli / Top Up Paket Isi Ulang</h2><button onClick={onClose} className="text-gray-400 text-xl">✕</button></div>
+            <div className="space-y-3 mb-4">
+              <div><label className="text-xs font-semibold text-gray-600 mb-1 block">No. WhatsApp</label><input value={phone} onChange={e=>setPhone(e.target.value)} placeholder="08xxxxxxxxxx" type="tel" className="w-full border border-gray-200 rounded-xl px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-violet-300"/></div>
+              <div><label className="text-xs font-semibold text-gray-600 mb-1 block">Nama Pelanggan</label><input value={name} onChange={e=>setName(e.target.value)} placeholder="Nama lengkap" className="w-full border border-gray-200 rounded-xl px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-violet-300"/></div>
+              <div><label className="text-xs font-semibold text-gray-600 mb-1 block">Jumlah Galon</label><div className="flex gap-3">{[5,10,20].map(n=><button key={n} onClick={()=>setGallon(n)} className={`flex-1 py-3 rounded-xl border-2 font-semibold text-sm ${gallon===n?"border-violet-500 bg-violet-50 text-violet-700":"border-gray-200 text-gray-600"}`}>{n} gln</button>)}</div></div>
+            </div>
+            <div className="bg-violet-50 rounded-xl p-3 mb-4"><div className="flex justify-between text-sm"><span className="text-gray-600">Total ({gallon} × {fmt(price)})</span><span className="font-bold text-violet-700">{fmt(total)}</span></div></div>
+            <button onClick={submit} disabled={!name||!phone||loading} className={`w-full py-3 rounded-xl font-bold text-white ${name&&phone&&!loading?"bg-violet-600":"bg-gray-300 cursor-not-allowed"}`}>{loading?"⏳ Menyimpan...":"Konfirmasi Pembelian Paket"}</button>
+          </Card>
+        </div>
+      );
+    }
+
+    // ============================================================
+    // MODAL: KELOLA PRODUK (tambah/edit stok & harga)
+    // ============================================================
+    function ProdukModal({state,reload,onClose}) {
+      const [view,setView]=useState("list"); // list | tambah | edit
+      const [editProduct,setEditProduct]=useState(null);
+      const [form,setForm]=useState({name:"",category:"galon_merk",unit:"galon",price:"",stock:""});
+      const [loading,setLoading]=useState(false);
+
+      const startEdit=(p)=>{ setEditProduct(p); setForm({name:p.name,category:p.category,unit:p.unit,price:String(p.price),stock:String(p.stock)}); setView("edit"); };
+      const startTambah=()=>{ setEditProduct(null); setForm({name:"",category:"galon_merk",unit:"galon",price:"",stock:""}); setView("tambah"); };
+
+      const save=async()=>{
+        if(!form.name||!form.price||form.stock==="")return;
+        setLoading(true);
+        try{
+          const p={ id:editProduct?editProduct.id:genId("P"), name:form.name, category:form.category, unit:form.unit, price:parseInt(form.price), stock:parseInt(form.stock), active:true };
+          await upsertProduct(p);
+          await reload();
+          setView("list");
+        }catch(e){alert("Gagal: "+e.message);}
+        setLoading(false);
+      };
+
+      const unitOptions={ isi_ulang:"galon", galon_merk:"galon", botolan:"dus", gas:"tabung" };
+
+      if(view==="list")return(
+        <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4 overflow-y-auto">
+          <Card className="p-5 w-full max-w-md my-2">
+            <div className="flex items-center justify-between mb-4"><h2 className="text-lg font-bold text-gray-800">📦 Kelola Produk</h2><button onClick={onClose} className="text-gray-400 text-xl">✕</button></div>
+            <button onClick={startTambah} className="w-full mb-3 py-2.5 rounded-xl bg-blue-600 text-white font-bold text-sm">+ Tambah Produk Baru</button>
+            <div className="space-y-2 max-h-96 overflow-y-auto">
+              {["isi_ulang","galon_merk","botolan","gas"].map(cat=>{
+                const prods=state.products.filter(p=>p.category===cat);
+                if(prods.length===0)return null;
+                return <div key={cat}>
+                  <p className="text-xs font-bold text-gray-400 uppercase mt-2 mb-1">{CAT_LABEL[cat]}</p>
+                  {prods.map(p=><div key={p.id} className="flex items-center justify-between p-3 bg-gray-50 rounded-xl mb-1">
+                    <div><div className="font-semibold text-sm text-gray-800">{p.name}</div><div className="text-xs text-gray-500">{fmt(p.price)} / {p.unit} · Stok: <strong className={p.stock<5?"text-red-500":"text-gray-700"}>{p.stock}</strong></div></div>
+                    <button onClick={()=>startEdit(p)} className="text-xs bg-white border border-gray-200 text-gray-600 px-3 py-1.5 rounded-xl font-semibold">Edit</button>
+                  </div>)}
+                </div>;
+              })}
+            </div>
+          </Card>
+        </div>
+      );
+
+      return(
+        <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4">
+          <Card className="p-5 w-full max-w-md">
+            <div className="flex items-center justify-between mb-4"><h2 className="text-lg font-bold text-gray-800">{view==="tambah"?"➕ Tambah Produk":"✏️ Edit Produk"}</h2><button onClick={()=>setView("list")} className="text-gray-400 text-xl">✕</button></div>
+            <div className="space-y-3">
+              <div><label className="text-xs font-semibold text-gray-600 mb-1 block">Nama Produk</label><input value={form.name} onChange={e=>setForm(f=>({...f,name:e.target.value}))} placeholder="Contoh: Aqua Galon 19L" className="w-full border border-gray-200 rounded-xl px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-300"/></div>
+              {view==="tambah"&&<div><label className="text-xs font-semibold text-gray-600 mb-1 block">Kategori</label><select value={form.category} onChange={e=>setForm(f=>({...f,category:e.target.value,unit:unitOptions[e.target.value]}))} className="w-full border border-gray-200 rounded-xl px-3 py-2 text-sm focus:outline-none"><option value="galon_merk">🏷️ Galon Bermerk</option><option value="botolan">🥤 Botolan/Gelas (per dus)</option><option value="gas">🔥 Gas Elpiji</option></select></div>}
+              <div className="grid grid-cols-2 gap-3">
+                <div><label className="text-xs font-semibold text-gray-600 mb-1 block">Harga (Rp)</label><input type="number" value={form.price} onChange={e=>setForm(f=>({...f,price:e.target.value}))} placeholder="0" className="w-full border border-gray-200 rounded-xl px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-300"/></div>
+                <div><label className="text-xs font-semibold text-gray-600 mb-1 block">Stok ({form.unit})</label><input type="number" value={form.stock} onChange={e=>setForm(f=>({...f,stock:e.target.value}))} placeholder="0" className="w-full border border-gray-200 rounded-xl px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-300"/></div>
+              </div>
+            </div>
+            <div className="flex gap-2 mt-4">
+              <button onClick={()=>setView("list")} className="flex-1 py-2.5 rounded-xl border-2 border-gray-200 text-gray-600 font-semibold text-sm">Batal</button>
+              <button onClick={save} disabled={!form.name||!form.price||form.stock===""||loading} className={`flex-1 py-2.5 rounded-xl font-bold text-white text-sm ${form.name&&form.price&&form.stock!==""&&!loading?"bg-blue-600":"bg-gray-300 cursor-not-allowed"}`}>{loading?"⏳ Menyimpan...":"💾 Simpan"}</button>
+            </div>
+          </Card>
+        </div>
+      );
+    }
+
+    // ============================================================
+    // PAGE: DASHBOARD
+    // ============================================================
+    function Dashboard({state}) {
+      const tp=state.customers.filter(c=>c.type==="piutang").reduce((s,c)=>s+c.balance,0);
+      const tk=state.customers.filter(c=>c.type==="paket").reduce((s,c)=>s+c.deferredRevenue,0);
+      const oc=state.customers.filter(c=>c.overdue).length;
+      const isiUlang=state.products.find(p=>p.category==="isi_ulang");
+      const lowStock=state.products.filter(p=>p.stock<=3);
+      return(
+        <div className="space-y-4">
+          <div><h2 className="text-xl font-bold text-gray-800">Dashboard</h2><p className="text-sm text-gray-400">Ringkasan keuangan & operasional</p></div>
+          {oc>0&&<div className="bg-red-50 border border-red-200 rounded-2xl p-4 flex items-start gap-3"><span className="text-2xl">🚨</span><div><p className="font-bold text-red-700">{oc} Pelanggan Jatuh Tempo!</p><p className="text-sm text-red-600">Segera tagih melalui halaman Tagihan.</p></div></div>}
+          {lowStock.length>0&&<div className="bg-amber-50 border border-amber-200 rounded-2xl p-3"><p className="font-bold text-amber-700 text-sm mb-1">⚠️ Stok Hampir Habis</p>{lowStock.map(p=><p key={p.id} className="text-xs text-amber-600">{p.name}: {p.stock} {p.unit}</p>)}</div>}
+          <div className="grid grid-cols-2 gap-3">
+            <StatCard icon="💵" label="Saldo Kas" value={fmt(state.cashBalance)} color="green"/>
+            <StatCard icon="💧" label="Stok Isi Ulang" value={`${isiUlang?.stock||0} galon`} sub={isiUlang?.stock<10?"⚠️ Hampir habis!":"Aman"} color={isiUlang?.stock<10?"red":"blue"}/>
+            <StatCard icon="📋" label="Total Piutang" value={fmt(tp)} sub="Belum dibayar" color="amber"/>
+            <StatCard icon="🎟️" label="Kewajiban Paket" value={fmt(tk)} sub="Kuota belum diambil" color="violet"/>
+          </div>
+
+          {/* Stok semua produk */}
+          <Card className="p-4">
+            <h3 className="font-bold text-gray-700 mb-3 text-sm">📦 Stok Semua Produk</h3>
+            <div className="space-y-1">
+              {state.products.map(p=><div key={p.id} className="flex items-center justify-between py-1.5 border-b border-gray-50 last:border-0">
+                <div className="text-sm text-gray-700">{p.name}</div>
+                <div className="flex items-center gap-2">
+                  <span className={`text-sm font-bold ${p.stock<=3?"text-red-500":p.stock<=10?"text-amber-500":"text-gray-700"}`}>{p.stock}</span>
+                  <span className="text-xs text-gray-400">{p.unit}</span>
+                </div>
+              </div>)}
+            </div>
+          </Card>
+
+          <Card className="p-4">
+            <h3 className="font-bold text-gray-700 mb-3 text-sm">🕐 Transaksi Terkini</h3>
+            <div>{[...state.transactions].reverse().slice(0,6).map(t=><div key={t.id} className="flex items-center justify-between py-2 border-b border-gray-50 last:border-0"><div><div className="font-medium text-gray-700 text-sm">{t.customerName}</div><div className="text-xs text-gray-400">{t.note} · {fmtDate(t.date)}</div></div><div className="text-right ml-2 flex-shrink-0"><div className="font-bold text-gray-800 text-sm">{fmt(t.amount)}</div><Badge color={t.type==="cash_sale"?"green":t.type==="subscription_takeout"?"amber":t.type==="pay_debt"?"green":"violet"}>{t.type==="cash_sale"?"Tunai":t.type==="subscription_takeout"?"Piutang":t.type==="pay_debt"?"Bayar":t.type==="package_purchase"?"Paket":"Kuota"}</Badge></div></div>)}</div>
+          </Card>
+        </div>
+      );
+    }
+
+    // ============================================================
+    // PAGE: PELANGGAN
+    // ============================================================
+    function TambahPelangganForm({state,reload,onDone}) {
+      const [name,setName]=useState(""),[phone,setPhone]=useState(""),[type,setType]=useState("piutang"),[dueDate,setDueDate]=useState("25"),[gallon,setGallon]=useState(10),[saved,setSaved]=useState(false),[sn,setSn]=useState(""),[loading,setLoading]=useState(false);
+      const isiUlang=state.products.find(p=>p.category==="isi_ulang");
+      const price=isiUlang?.price||15000;
+      const save=async()=>{
+        if(!name.trim()||!phone.trim())return;
+        setLoading(true);
+        try{
+          const id=genId("C"),now=new Date(),due=`${now.getFullYear()}-${String(now.getMonth()+1).padStart(2,"0")}-${dueDate.padStart(2,"0")}`;
+          if(type==="piutang"){
+            await upsertCustomer({id,name:name.trim(),phone:phone.trim(),type:"piutang",balance:0,gallon_taken:0,dueDate:due,overdue:false,gallonDeposit:0,packageQuota:0,usedQuota:0,packagePaid:0,deferredRevenue:0});
+          }else{
+            const amt=gallon*price;
+            const nc={id,name:name.trim(),phone:phone.trim(),type:"paket",balance:0,gallon_taken:0,dueDate:null,overdue:false,gallonDeposit:0,packageQuota:gallon,usedQuota:0,packagePaid:amt,deferredRevenue:amt};
+            const tx={id:genId("T"),date:today(),customerId:id,customerName:name.trim(),type:"package_purchase",qty:gallon,amount:amt,note:"Pembelian paket baru",productName:"Air Isi Ulang"};
+            await Promise.all([updateAppState({cash_balance:state.cashBalance+amt}),upsertCustomer(nc),insertTx(tx)]);
+          }
+          await reload(); setSn(name.trim()); setSaved(true);
+        }catch(e){alert("Gagal: "+e.message);}
+        setLoading(false);
+      };
+      if(saved)return(<Card className="p-6 text-center"><div className="text-5xl mb-3">✅</div><p className="text-xl font-bold text-gray-800">{sn} berhasil ditambahkan!</p><div className="flex gap-3 mt-5"><button onClick={()=>{setName("");setPhone("");setType("piutang");setSaved(false);}} className="flex-1 py-4 rounded-2xl border-2 border-blue-500 text-blue-600 font-bold text-base">+ Tambah Lagi</button><button onClick={onDone} className="flex-1 py-4 rounded-2xl bg-blue-600 text-white font-bold text-base">Selesai</button></div></Card>);
+      return(
+        <Card className="p-5">
+          <h3 className="text-lg font-bold text-gray-800 mb-5">➕ Tambah Pelanggan Baru</h3>
+          <div className="mb-5"><label className="block text-base font-bold text-gray-700 mb-2">👤 Nama Pelanggan</label><input value={name} onChange={e=>setName(e.target.value)} placeholder="Contoh: Pak Budi" className="w-full border-2 border-gray-200 rounded-2xl px-4 py-3 text-lg focus:outline-none focus:border-blue-400"/></div>
+          <div className="mb-5"><label className="block text-base font-bold text-gray-700 mb-2">📱 Nomor WhatsApp</label><input value={phone} onChange={e=>setPhone(e.target.value)} placeholder="Contoh: 08123456789" type="tel" className="w-full border-2 border-gray-200 rounded-2xl px-4 py-3 text-lg focus:outline-none focus:border-blue-400"/></div>
+          <div className="mb-5"><label className="block text-base font-bold text-gray-700 mb-3">🗂️ Jenis Langganan</label><div className="grid grid-cols-2 gap-3"><button onClick={()=>setType("piutang")} className={`py-4 rounded-2xl border-2 font-bold text-base ${type==="piutang"?"border-amber-500 bg-amber-50 text-amber-700":"border-gray-200 text-gray-500"}`}>📋 Tagihan<br/><span className="text-xs font-normal">Bayar akhir bulan</span></button><button onClick={()=>setType("paket")} className={`py-4 rounded-2xl border-2 font-bold text-base ${type==="paket"?"border-violet-500 bg-violet-50 text-violet-700":"border-gray-200 text-gray-500"}`}>🎟️ Paket<br/><span className="text-xs font-normal">Bayar di awal</span></button></div></div>
+          {type==="piutang"&&<div className="mb-5"><label className="block text-base font-bold text-gray-700 mb-3">📅 Jatuh Tempo Tiap Bulan</label><div className="flex gap-2 flex-wrap">{["10","15","20","25","30"].map(d=><button key={d} onClick={()=>setDueDate(d)} className={`px-5 py-3 rounded-2xl border-2 font-bold text-base ${dueDate===d?"border-blue-500 bg-blue-50 text-blue-700":"border-gray-200 text-gray-500"}`}>Tgl {d}</button>)}</div></div>}
+          {type==="paket"&&<div className="mb-5"><label className="block text-base font-bold text-gray-700 mb-3">🪣 Jumlah Galon Paket</label><div className="flex gap-3">{[5,10,20].map(n=><button key={n} onClick={()=>setGallon(n)} className={`flex-1 py-4 rounded-2xl border-2 font-bold text-xl ${gallon===n?"border-violet-500 bg-violet-50 text-violet-700":"border-gray-200 text-gray-500"}`}>{n}<br/><span className="text-xs font-normal">galon</span></button>)}</div><p className="text-sm text-gray-400 mt-2 text-center">Bayar sekarang: <strong>{fmt(gallon*price)}</strong></p></div>}
+          <button onClick={save} disabled={!name.trim()||!phone.trim()||loading} className={`w-full py-4 rounded-2xl font-bold text-xl ${name.trim()&&phone.trim()&&!loading?"bg-blue-600 text-white":"bg-gray-200 text-gray-400 cursor-not-allowed"}`}>{loading?"⏳ Menyimpan...":"💾 Simpan Pelanggan"}</button>
+        </Card>
+      );
+    }
+
+    function PelangganPage({state,reload}) {
+      const [tab,setTab]=useState("daftar"),[lt,setLt]=useState("piutang");
+      const filtered=state.customers.filter(c=>c.type===lt);
+      return(
+        <div className="space-y-4">
+          <div><h2 className="text-xl font-bold text-gray-800">Pelanggan</h2><p className="text-sm text-gray-400">Khusus langganan air isi ulang</p></div>
+          <div className="flex gap-2">
+            <button onClick={()=>setTab("tambah")} className={`flex-1 py-3 rounded-2xl border-2 font-bold text-base ${tab==="tambah"?"border-blue-500 bg-blue-50 text-blue-700":"border-gray-200 text-gray-500"}`}>➕ Tambah</button>
+            <button onClick={()=>setTab("daftar")} className={`flex-1 py-3 rounded-2xl border-2 font-bold text-base ${tab==="daftar"?"border-gray-700 bg-gray-50 text-gray-700":"border-gray-200 text-gray-500"}`}>📋 Daftar</button>
+          </div>
+          {tab==="tambah"&&<TambahPelangganForm state={state} reload={reload} onDone={()=>setTab("daftar")}/>}
+          {tab==="daftar"&&<>
+            <div className="flex gap-2">
+              <button onClick={()=>setLt("piutang")} className={`px-4 py-2 rounded-xl text-sm font-semibold border-2 ${lt==="piutang"?"border-amber-500 bg-amber-50 text-amber-700":"border-gray-200 text-gray-600"}`}>📋 Tagihan ({state.customers.filter(c=>c.type==="piutang").length})</button>
+              <button onClick={()=>setLt("paket")} className={`px-4 py-2 rounded-xl text-sm font-semibold border-2 ${lt==="paket"?"border-violet-500 bg-violet-50 text-violet-700":"border-gray-200 text-gray-600"}`}>🎟️ Paket ({state.customers.filter(c=>c.type==="paket").length})</button>
+            </div>
+            {filtered.length===0?<Card className="p-8 text-center"><div className="text-4xl mb-2">👤</div><p className="text-gray-500">Belum ada pelanggan.</p></Card>:
+            <div className="space-y-3">{filtered.map(c=><Card key={c.id} className="p-4">
+              <div className="flex items-start justify-between mb-2"><div><div className="font-bold text-gray-800 text-base">{c.name}</div><div className="text-sm text-gray-400">📱 {c.phone}</div></div>{c.overdue&&<Badge color="red">Jatuh Tempo</Badge>}</div>
+              {c.type==="piutang"&&<><div className="bg-amber-50 rounded-xl p-3 mb-2"><div className="flex justify-between text-sm"><span className="text-gray-600">Piutang</span><span className="font-bold text-amber-700">{fmt(c.balance)}</span></div><div className="text-xs text-gray-400 mt-1">Galon diambil: {c.gallon_taken}</div></div><div className="text-xs text-gray-400">Jatuh Tempo: {c.dueDate?fmtDate(c.dueDate):"-"}</div></>}
+              {c.type==="paket"&&<div className="bg-violet-50 rounded-xl p-3"><div className="flex justify-between text-sm mb-1"><span className="text-gray-600">Sisa Kuota</span><span className="font-bold text-violet-700">{c.packageQuota-c.usedQuota}/{c.packageQuota} galon</span></div><div className="w-full bg-violet-200 rounded-full h-1.5"><div className="bg-violet-500 h-1.5 rounded-full" style={{width:`${c.packageQuota>0?((c.packageQuota-c.usedQuota)/c.packageQuota)*100:0}%`}}/></div><div className="text-xs text-gray-400 mt-1">Kewajiban: {fmt(c.deferredRevenue)}</div>{(c.packageQuota-c.usedQuota)<=2&&<div className="text-amber-600 text-xs font-semibold mt-1">⚠️ Kuota hampir habis!</div>}</div>}
+            </Card>)}</div>}
+          </>}
+        </div>
+      );
+    }
+
+    // ============================================================
+    // PAGE: TAGIHAN
+    // ============================================================
+    function TagihanPage({state}) {
+      const ov=state.customers.filter(c=>c.type==="piutang"&&c.balance>0);
+      return(
+        <div className="space-y-4">
+          <div><h2 className="text-xl font-bold text-gray-800">Daftar Tagihan</h2><p className="text-sm text-gray-400">Piutang pelanggan langganan isi ulang</p></div>
+          {ov.length===0?<Card className="p-8 text-center"><div className="text-4xl mb-2">🎉</div><p className="font-semibold text-gray-700">Semua piutang sudah lunas!</p></Card>:
+          <div className="space-y-3">{ov.map(c=><Card key={c.id} className={`p-4 ${c.overdue?"border-red-200 bg-red-50":""}`}>
+            <div className="flex items-start justify-between mb-2"><div><div className="font-bold text-gray-800">{c.name}</div><div className="text-xs text-gray-400">📱 {c.phone}</div></div>{c.overdue?<Badge color="red">🔴 Jatuh Tempo</Badge>:<Badge color="amber">🟡 Berjalan</Badge>}</div>
+            <div className="flex justify-between items-center">
+              <div className="text-sm"><div>Tagihan: <strong className="text-red-600">{fmt(c.balance)}</strong></div><div className="text-xs text-gray-400">Jatuh Tempo: {c.dueDate?fmtDate(c.dueDate):"-"}</div></div>
+              <a href={`https://wa.me/${c.phone.replace(/^0/,"62")}?text=Halo%20${encodeURIComponent(c.name)}%2C%20tagihan%20air%20Anda%20sebesar%20${encodeURIComponent(fmt(c.balance))}%20sudah%20jatuh%20tempo.%20Mohon%20segera%20dilunasi.%20Terima%20kasih.`} target="_blank" rel="noopener noreferrer" className="flex items-center gap-1.5 bg-green-500 text-white text-xs font-semibold px-3 py-2 rounded-xl">📲 WhatsApp</a>
+            </div>
+          </Card>)}</div>}
+        </div>
+      );
+    }
+
+    // ============================================================
+    // PAGE: LAPORAN
+    // ============================================================
+    function LaporanPage({state}) {
+      const cs=state.transactions.filter(t=>t.type==="cash_sale"),pu=state.transactions.filter(t=>t.type==="package_usage"),dp=state.transactions.filter(t=>t.type==="pay_debt"),pp=state.transactions.filter(t=>t.type==="package_purchase"),st=state.transactions.filter(t=>t.type==="subscription_takeout");
+      const sum=a=>a.reduce((s,t)=>s+t.amount,0);
+      const tr=sum(cs)+sum(pu)+sum(st),tc=sum(cs)+sum(dp)+sum(pp);
+      const tp=state.customers.filter(c=>c.type==="piutang").reduce((s,c)=>s+c.balance,0);
+      const tk=state.customers.filter(c=>c.type==="paket").reduce((s,c)=>s+c.deferredRevenue,0);
+      const stockValue=state.products.reduce((s,p)=>s+p.price*p.stock,0);
+      return(
+        <div className="space-y-5">
+          <div><h2 className="text-xl font-bold text-gray-800">Laporan Keuangan</h2><p className="text-sm text-gray-400">Laba Rugi + Neraca terpadu</p></div>
+          <Card className="p-4"><h3 className="font-bold text-gray-700 mb-3 text-sm">📊 Laba Rugi <span className="text-xs text-gray-400 font-normal">(Accrual)</span></h3><div className="space-y-2 text-sm"><div className="flex justify-between"><span className="text-gray-600">Penjualan Tunai</span><span className="font-semibold">{fmt(sum(cs))}</span></div><div className="flex justify-between"><span className="text-gray-600">Langganan Piutang (diakui)</span><span className="font-semibold">{fmt(sum(st))}</span></div><div className="flex justify-between"><span className="text-gray-600">Penggunaan Kuota Paket</span><span className="font-semibold">{fmt(sum(pu))}</span></div><div className="border-t pt-2 flex justify-between font-bold text-gray-800"><span>Total Pendapatan</span><span className="text-emerald-600">{fmt(tr)}</span></div></div></Card>
+          <Card className="p-4"><h3 className="font-bold text-gray-700 mb-3 text-sm">💵 Arus Kas</h3><div className="space-y-2 text-sm"><div className="flex justify-between"><span className="text-gray-600">Dari Penjualan Tunai</span><span className="font-semibold text-emerald-600">+{fmt(sum(cs))}</span></div><div className="flex justify-between"><span className="text-gray-600">Dari Pelunasan Piutang</span><span className="font-semibold text-emerald-600">+{fmt(sum(dp))}</span></div><div className="flex justify-between"><span className="text-gray-600">Dari Pembelian Paket</span><span className="font-semibold text-emerald-600">+{fmt(sum(pp))}</span></div><div className="border-t pt-2 flex justify-between font-bold text-gray-800"><span>Total Cash In</span><span className="text-emerald-600">{fmt(tc)}</span></div></div></Card>
+          <Card className="p-4"><h3 className="font-bold text-gray-700 mb-3 text-sm">⚖️ Neraca</h3><div className="grid grid-cols-2 gap-4"><div><p className="font-semibold text-gray-400 text-xs uppercase mb-2">ASET</p><div className="space-y-1.5">{[["Kas",fmt(state.cashBalance)],["Piutang Usaha",fmt(tp)],["Nilai Stok Produk",fmt(stockValue)]].map(([k,v])=><div key={k} className="flex justify-between text-xs"><span className="text-gray-600">{k}</span><span className="font-semibold text-gray-800">{v}</span></div>)}</div></div><div><p className="font-semibold text-gray-400 text-xs uppercase mb-2">KEWAJIBAN</p><div className="flex justify-between text-xs"><span className="text-gray-600">Pend. Ditangguhkan</span><span className="font-semibold text-gray-800">{fmt(tk)}</span></div></div></div></Card>
+        </div>
+      );
+    }
+
+    // ============================================================
+    // APP ROOT
+    // ============================================================
+    function App() {
+      const [state,setState]=useState(null),[page,setPage]=useState("dashboard"),[modal,setModal]=useState(null),[error,setError]=useState(null);
+      const reload=useCallback(async()=>{ try{ setState(await loadAll()); }catch(e){ setError(e.message); } },[]);
+      useEffect(()=>{ reload(); },[]);
+      const nav=[{key:"dashboard",icon:"🏠",label:"Beranda"},{key:"pelanggan",icon:"👥",label:"Pelanggan"},{key:"tagihan",icon:"🔔",label:"Tagihan"},{key:"laporan",icon:"📊",label:"Laporan"}];
+      if(error)return(<div className="min-h-screen flex items-center justify-center p-8"><div className="text-center"><div className="text-4xl mb-3">❌</div><p className="font-bold text-red-700">Gagal terhubung ke database</p><p className="text-sm text-gray-500 mt-1">{error}</p><button onClick={reload} className="mt-4 bg-blue-600 text-white px-6 py-2 rounded-xl font-semibold">Coba Lagi</button></div></div>);
+      if(!state)return(<div className="min-h-screen flex items-center justify-center"><div className="text-center"><div className="w-12 h-12 border-4 border-blue-500 border-t-transparent rounded-full animate-spin mx-auto mb-3"></div><p className="text-gray-500 text-sm">Memuat data...</p></div></div>);
+      const oc=state.customers.filter(c=>c.overdue).length;
+      return(
+        <div className="min-h-screen bg-gray-50 flex flex-col max-w-lg mx-auto">
+          <div className="bg-white border-b border-gray-100 px-4 py-3 flex items-center justify-between sticky top-0 z-10">
+            <div className="flex items-center gap-2"><div className="w-8 h-8 bg-gradient-to-br from-blue-500 to-cyan-500 rounded-xl flex items-center justify-center text-white font-bold">💧</div><div><div className="font-bold text-gray-800 text-sm leading-tight">AirKu POS</div><div className="text-xs text-gray-400">Depo Air Minum</div></div></div>
+            <div className="flex gap-1.5">
+              <button onClick={reload} className="text-xs bg-gray-100 text-gray-600 font-semibold px-2 py-1.5 rounded-xl">🔄</button>
+              <button onClick={()=>setModal("produk")} className="text-xs bg-gray-100 text-gray-600 font-semibold px-2 py-1.5 rounded-xl">📦</button>
+              <button onClick={()=>setModal("paket")} className="text-xs bg-violet-100 text-violet-700 font-semibold px-2 py-1.5 rounded-xl">🎟️</button>
+              <button onClick={()=>setModal("kasir")} className="text-xs bg-blue-600 text-white font-semibold px-3 py-1.5 rounded-xl">🧾 Kasir</button>
+            </div>
+          </div>
+          <div className="flex-1 overflow-y-auto p-4 pb-24">
+            {page==="dashboard"&&<Dashboard state={state}/>}
+            {page==="pelanggan"&&<PelangganPage state={state} reload={reload}/>}
+            {page==="tagihan"&&<TagihanPage state={state}/>}
+            {page==="laporan"&&<LaporanPage state={state}/>}
+          </div>
+          {page==="tagihan"&&<div className="fixed bottom-20 left-1/2 -translate-x-1/2 w-full max-w-lg px-4 z-10"><button onClick={()=>setModal("pelunasan")} className="w-full bg-emerald-600 text-white font-bold py-3 rounded-2xl shadow-lg">💰 Terima Pelunasan Piutang</button></div>}
+          <div className="fixed bottom-0 left-1/2 -translate-x-1/2 w-full max-w-lg bg-white border-t border-gray-100 flex z-10">
+            {nav.map(n=><button key={n.key} onClick={()=>setPage(n.key)} className={`flex-1 py-3 flex flex-col items-center gap-0.5 relative ${page===n.key?"text-blue-600":"text-gray-400"}`}><span className="text-lg">{n.icon}</span><span className="text-xs font-medium">{n.label}</span>{n.key==="tagihan"&&oc>0&&<span className="absolute top-1.5 right-3 w-4 h-4 bg-red-500 text-white text-xs font-bold rounded-full flex items-center justify-center">{oc}</span>}</button>)}
+          </div>
+          {modal==="kasir"&&<KasirModal state={state} reload={reload} onClose={()=>setModal(null)}/>}
+          {modal==="pelunasan"&&<PelunasanModal state={state} reload={reload} onClose={()=>setModal(null)}/>}
+          {modal==="paket"&&<BeliPaketModal state={state} reload={reload} onClose={()=>setModal(null)}/>}
+          {modal==="produk"&&<ProdukModal state={state} reload={reload} onClose={()=>setModal(null)}/>}
+        </div>
+      );
+    }
+
+    ReactDOM.createRoot(document.getElementById("root")).render(<App/>);
+  </script>
+</body>
+</html>    async function loadAll() {
       const [{ data: appState }, { data: customers }, { data: transactions }] = await Promise.all([
         sb.from("app_state").select("*").eq("id", 1).single(),
         sb.from("customers").select("*").order("created_at"),
